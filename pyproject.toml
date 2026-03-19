@@ -1,0 +1,15 @@
+[project]
+name = "llm-provider"
+version = "0.1.0"
+description = "Minimal pluggable LLM provider abstraction (Claude + Ollama)"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+claude = ["anthropic>=0.52"]
+ollama = ["httpx>=0.28"]
+all = ["anthropic>=0.52", "httpx>=0.28"]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.backends._legacy:_Backend"
