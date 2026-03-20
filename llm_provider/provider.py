@@ -23,6 +23,15 @@ class AIProvider(ABC):
             raw = raw.rsplit("```", 1)[0]
         return json.loads(raw.strip())
 
+    def close(self) -> None:
+        """Release resources held by this provider. No-op by default."""
+
+    def __enter__(self) -> AIProvider:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
 
 class ClaudeProvider(AIProvider):
     def __init__(
@@ -33,9 +42,12 @@ class ClaudeProvider(AIProvider):
     ) -> None:
         import anthropic
 
-        self._client = anthropic.Anthropic(
-            api_key=api_key or os.environ.get("ANTHROPIC_API_KEY", "")
-        )
+        resolved_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        if not resolved_key:
+            raise ValueError(
+                "Anthropic API key required — pass api_key or set ANTHROPIC_API_KEY"
+            )
+        self._client = anthropic.Anthropic(api_key=resolved_key)
         self._model = model
         self._max_tokens = max_tokens
 
@@ -57,16 +69,31 @@ class OllamaProvider(AIProvider):
             "OLLAMA_BASE_URL", "http://localhost:11434"
         )
         self._model = model or os.environ.get("OLLAMA_MODEL", "llama3")
-        self._client = httpx.Client(timeout=60.0)
+        self._client: httpx.Client | None = httpx.Client(timeout=60.0)
 
     def complete(self, system: str, user: str) -> str:
+        import httpx
+
         prompt = f"{system}\n\n{user}"
-        response = self._client.post(
-            f"{self._base_url}/api/generate",
-            json={"model": self._model, "prompt": prompt, "stream": False},
-        )
+        try:
+            response = self._client.post(
+                f"{self._base_url}/api/generate",
+                json={"model": self._model, "prompt": prompt, "stream": False},
+            )
+        except httpx.ConnectError:
+            raise ConnectionError(
+                f"Cannot reach Ollama at {self._base_url}"
+            ) from None
         response.raise_for_status()
         return response.json()["response"]
+
+    def close(self) -> None:
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+    def __del__(self) -> None:
+        self.close()
 
 
 def get_provider(
