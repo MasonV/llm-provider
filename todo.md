@@ -16,7 +16,7 @@ Current state: core API works (AIProvider ABC, ClaudeProvider, OllamaProvider, `
 
 - [ ] **Streaming support** — add an optional `stream=True` path returning an iterator/async generator
 - [x] **Retry / rate-limit handling** — exponential backoff via `_retry()`, configurable `max_retries` param
-- [ ] **Response metadata** — expose token usage, model name, and stop reason alongside the text
+- [x] **Response metadata** — `CompletionResult` dataclass via `complete_with_metadata()`
 - [ ] **Async variants** — `async complete()` for use in async codebases
 - [x] **Logging** — `logging.getLogger(__name__)` for provider selection, requests, and retries
 

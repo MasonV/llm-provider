@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from typing import Any
 
 _log = logging.getLogger(__name__)
@@ -29,6 +30,14 @@ def _retry(
             time.sleep(delay)
 
 
+@dataclass
+class CompletionResult:
+    text: str
+    model: str
+    usage: dict[str, int] = field(default_factory=dict)
+    stop_reason: str | None = None
+
+
 class AIProvider(ABC):
     @abstractmethod
     def complete(self, system: str, user: str) -> str: ...
@@ -46,6 +55,10 @@ class AIProvider(ABC):
             # Drop closing fence
             raw = raw.rsplit("```", 1)[0]
         return json.loads(raw.strip())
+
+    def complete_with_metadata(self, system: str, user: str) -> CompletionResult:
+        """Like complete(), but returns a CompletionResult with model info and usage."""
+        return CompletionResult(text=self.complete(system, user), model="unknown")
 
     def close(self) -> None:
         """Release resources held by this provider. No-op by default."""
@@ -78,29 +91,40 @@ class ClaudeProvider(AIProvider):
         self._max_retries = max_retries
 
     def complete(self, system: str, user: str) -> str:
+        return self.complete_with_metadata(system, user).text
+
+    def complete_with_metadata(self, system: str, user: str) -> CompletionResult:
         import anthropic
 
         _log.debug("Claude request: model=%s, max_tokens=%d", self._model, self._max_tokens)
 
-        def _call() -> str:
-            msg = self._client.messages.create(
+        def _call() -> Any:
+            return self._client.messages.create(
                 model=self._model,
                 max_tokens=self._max_tokens,
                 system=system,
                 messages=[{"role": "user", "content": user}],
             )
-            return msg.content[0].text
 
         if self._max_retries <= 0:
-            text = _call()
+            msg = _call()
         else:
-            text = _retry(
+            msg = _retry(
                 _call,
                 max_attempts=self._max_retries,
                 retryable=(anthropic.RateLimitError, anthropic.InternalServerError),
             )
+        text = msg.content[0].text
         _log.debug("Claude response: %d chars", len(text))
-        return text
+        return CompletionResult(
+            text=text,
+            model=msg.model,
+            usage={
+                "input_tokens": msg.usage.input_tokens,
+                "output_tokens": msg.usage.output_tokens,
+            },
+            stop_reason=msg.stop_reason,
+        )
 
 
 class OllamaProvider(AIProvider):
@@ -117,12 +141,15 @@ class OllamaProvider(AIProvider):
         self._max_retries = max_retries
 
     def complete(self, system: str, user: str) -> str:
+        return self.complete_with_metadata(system, user).text
+
+    def complete_with_metadata(self, system: str, user: str) -> CompletionResult:
         import httpx
 
         _log.debug("Ollama request: model=%s, url=%s", self._model, self._base_url)
         prompt = f"{system}\n\n{user}"
 
-        def _call() -> str:
+        def _call() -> dict:
             try:
                 response = self._client.post(
                     f"{self._base_url}/api/generate",
@@ -133,18 +160,27 @@ class OllamaProvider(AIProvider):
                     f"Cannot reach Ollama at {self._base_url}"
                 ) from None
             response.raise_for_status()
-            return response.json()["response"]
+            return response.json()
 
         if self._max_retries <= 0:
-            text = _call()
+            data = _call()
         else:
-            text = _retry(
+            data = _retry(
                 _call,
                 max_attempts=self._max_retries,
                 retryable=(ConnectionError, httpx.HTTPStatusError),
             )
+        text = data["response"]
         _log.debug("Ollama response: %d chars", len(text))
-        return text
+        return CompletionResult(
+            text=text,
+            model=data.get("model", self._model),
+            usage={
+                "prompt_tokens": data.get("prompt_eval_count", 0),
+                "completion_tokens": data.get("eval_count", 0),
+            },
+            stop_reason=data.get("done_reason"),
+        )
 
     def close(self) -> None:
         if self._client is not None:

@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from llm_provider import AIProvider, ClaudeProvider, OllamaProvider, get_provider
+from llm_provider import AIProvider, ClaudeProvider, CompletionResult, OllamaProvider, get_provider
 from llm_provider.provider import _retry
 
 
@@ -87,10 +87,18 @@ class TestOllamaProvider:
         monkeypatch.setattr(httpx, "Client", lambda **kw: mock_client)
         return OllamaProvider(base_url="http://localhost:11434", model="llama3")
 
+    _OLLAMA_RESPONSE = {
+        "response": "world",
+        "model": "llama3",
+        "prompt_eval_count": 10,
+        "eval_count": 5,
+        "done_reason": "stop",
+    }
+
     def test_complete(self, monkeypatch: pytest.MonkeyPatch) -> None:
         mock_client = MagicMock()
         mock_resp = MagicMock()
-        mock_resp.json.return_value = {"response": "world"}
+        mock_resp.json.return_value = self._OLLAMA_RESPONSE
         mock_resp.raise_for_status = MagicMock()
         mock_client.post.return_value = mock_resp
 
@@ -207,3 +215,62 @@ class TestRetry:
         with pytest.raises(ConnectionError, match="Cannot reach Ollama"):
             p.complete("sys", "usr")
         assert mock_client.post.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# complete_with_metadata
+# ---------------------------------------------------------------------------
+
+class TestCompleteWithMetadata:
+    def test_stub_provider_fallback(self) -> None:
+        p = _StubProvider("hello")
+        result = p.complete_with_metadata("s", "u")
+        assert isinstance(result, CompletionResult)
+        assert result.text == "hello"
+        assert result.model == "unknown"
+        assert result.usage == {}
+
+    @patch("llm_provider.provider.anthropic", create=True)
+    def test_claude_metadata(self, mock_anthropic: MagicMock) -> None:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_msg = MagicMock()
+        mock_msg.content = [MagicMock(text="hello")]
+        mock_msg.model = "claude-haiku-4-5-20251001"
+        mock_msg.usage.input_tokens = 12
+        mock_msg.usage.output_tokens = 5
+        mock_msg.stop_reason = "end_turn"
+        mock_client.messages.create.return_value = mock_msg
+
+        with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
+            p = ClaudeProvider(api_key="sk-test")
+            result = p.complete_with_metadata("system", "user")
+
+        assert result.text == "hello"
+        assert result.model == "claude-haiku-4-5-20251001"
+        assert result.usage == {"input_tokens": 12, "output_tokens": 5}
+        assert result.stop_reason == "end_turn"
+
+    def test_ollama_metadata(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "response": "world",
+            "model": "llama3",
+            "prompt_eval_count": 10,
+            "eval_count": 5,
+            "done_reason": "stop",
+        }
+        mock_resp.raise_for_status = MagicMock()
+        mock_client.post.return_value = mock_resp
+        monkeypatch.setattr(httpx, "Client", lambda **kw: mock_client)
+
+        p = OllamaProvider(base_url="http://localhost:11434", model="llama3")
+        result = p.complete_with_metadata("sys", "usr")
+
+        assert result.text == "world"
+        assert result.model == "llama3"
+        assert result.usage == {"prompt_tokens": 10, "completion_tokens": 5}
+        assert result.stop_reason == "stop"
