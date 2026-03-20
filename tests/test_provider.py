@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from llm_provider import AIProvider, ClaudeProvider, OllamaProvider, get_provider
+from llm_provider.provider import _retry
 
 
 # ---------------------------------------------------------------------------
@@ -152,3 +153,57 @@ class TestCompleteJson:
     def test_whitespace_padding(self) -> None:
         p = _StubProvider('  \n{"key": "value"}\n  ')
         assert p.complete_json("s", "u") == {"key": "value"}
+
+
+# ---------------------------------------------------------------------------
+# _retry
+# ---------------------------------------------------------------------------
+
+class TestRetry:
+    def test_succeeds_on_second_attempt(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("llm_provider.provider.time.sleep", lambda _: None)
+        calls = 0
+
+        def _fn() -> str:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ValueError("transient")
+            return "ok"
+
+        result = _retry(_fn, max_attempts=3, base_delay=1.0, retryable=(ValueError,))
+        assert result == "ok"
+        assert calls == 2
+
+    def test_exhausted_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("llm_provider.provider.time.sleep", lambda _: None)
+
+        def _fn() -> str:
+            raise ValueError("always fails")
+
+        with pytest.raises(ValueError, match="always fails"):
+            _retry(_fn, max_attempts=2, base_delay=1.0, retryable=(ValueError,))
+
+    def test_non_retryable_raises_immediately(self) -> None:
+        calls = 0
+
+        def _fn() -> str:
+            nonlocal calls
+            calls += 1
+            raise TypeError("not retryable")
+
+        with pytest.raises(TypeError):
+            _retry(_fn, max_attempts=3, base_delay=1.0, retryable=(ValueError,))
+        assert calls == 1
+
+    def test_ollama_retry_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        mock_client = MagicMock()
+        mock_client.post.side_effect = httpx.ConnectError("refused")
+        monkeypatch.setattr(httpx, "Client", lambda **kw: mock_client)
+
+        p = OllamaProvider(base_url="http://localhost:11434", model="llama3", max_retries=0)
+        with pytest.raises(ConnectionError, match="Cannot reach Ollama"):
+            p.complete("sys", "usr")
+        assert mock_client.post.call_count == 1

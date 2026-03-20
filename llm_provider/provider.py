@@ -1,8 +1,32 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 from abc import ABC, abstractmethod
+from typing import Any
+
+_log = logging.getLogger(__name__)
+
+
+def _retry(
+    fn: Any,
+    *,
+    max_attempts: int = 3,
+    base_delay: float = 1.0,
+    retryable: tuple[type[Exception], ...],
+) -> Any:
+    """Call *fn()* with exponential backoff on retryable exceptions."""
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except retryable:
+            if attempt + 1 == max_attempts:
+                raise
+            delay = base_delay * 2**attempt
+            _log.warning("Attempt %d failed, retrying in %.1fs", attempt + 1, delay)
+            time.sleep(delay)
 
 
 class AIProvider(ABC):
@@ -39,6 +63,7 @@ class ClaudeProvider(AIProvider):
         api_key: str = "",
         model: str = "claude-haiku-4-5-20251001",
         max_tokens: int = 512,
+        max_retries: int = 3,
     ) -> None:
         import anthropic
 
@@ -50,19 +75,38 @@ class ClaudeProvider(AIProvider):
         self._client = anthropic.Anthropic(api_key=resolved_key)
         self._model = model
         self._max_tokens = max_tokens
+        self._max_retries = max_retries
 
     def complete(self, system: str, user: str) -> str:
-        msg = self._client.messages.create(
-            model=self._model,
-            max_tokens=self._max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-        )
-        return msg.content[0].text
+        import anthropic
+
+        _log.debug("Claude request: model=%s, max_tokens=%d", self._model, self._max_tokens)
+
+        def _call() -> str:
+            msg = self._client.messages.create(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+            return msg.content[0].text
+
+        if self._max_retries <= 0:
+            text = _call()
+        else:
+            text = _retry(
+                _call,
+                max_attempts=self._max_retries,
+                retryable=(anthropic.RateLimitError, anthropic.InternalServerError),
+            )
+        _log.debug("Claude response: %d chars", len(text))
+        return text
 
 
 class OllamaProvider(AIProvider):
-    def __init__(self, base_url: str = "", model: str = "") -> None:
+    def __init__(
+        self, base_url: str = "", model: str = "", max_retries: int = 3
+    ) -> None:
         import httpx
 
         self._base_url = base_url or os.environ.get(
@@ -70,22 +114,37 @@ class OllamaProvider(AIProvider):
         )
         self._model = model or os.environ.get("OLLAMA_MODEL", "llama3")
         self._client: httpx.Client | None = httpx.Client(timeout=60.0)
+        self._max_retries = max_retries
 
     def complete(self, system: str, user: str) -> str:
         import httpx
 
+        _log.debug("Ollama request: model=%s, url=%s", self._model, self._base_url)
         prompt = f"{system}\n\n{user}"
-        try:
-            response = self._client.post(
-                f"{self._base_url}/api/generate",
-                json={"model": self._model, "prompt": prompt, "stream": False},
+
+        def _call() -> str:
+            try:
+                response = self._client.post(
+                    f"{self._base_url}/api/generate",
+                    json={"model": self._model, "prompt": prompt, "stream": False},
+                )
+            except httpx.ConnectError:
+                raise ConnectionError(
+                    f"Cannot reach Ollama at {self._base_url}"
+                ) from None
+            response.raise_for_status()
+            return response.json()["response"]
+
+        if self._max_retries <= 0:
+            text = _call()
+        else:
+            text = _retry(
+                _call,
+                max_attempts=self._max_retries,
+                retryable=(ConnectionError, httpx.HTTPStatusError),
             )
-        except httpx.ConnectError:
-            raise ConnectionError(
-                f"Cannot reach Ollama at {self._base_url}"
-            ) from None
-        response.raise_for_status()
-        return response.json()["response"]
+        _log.debug("Ollama response: %d chars", len(text))
+        return text
 
     def close(self) -> None:
         if self._client is not None:
@@ -112,6 +171,7 @@ def get_provider(
       3. Built-in defaults
     """
     name = provider or os.environ.get("AI_PROVIDER", "claude")
+    _log.debug("Using provider %r", name)
     if name == "claude":
         return ClaudeProvider(api_key=api_key)
     if name == "ollama":
