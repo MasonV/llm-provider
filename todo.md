@@ -15,10 +15,10 @@ Current state: core API works (AIProvider ABC, ClaudeProvider, OllamaProvider, `
 ## Medium Priority
 
 - [ ] **Streaming support** — add an optional `stream=True` path returning an iterator/async generator
-- [ ] **Retry / rate-limit handling** — exponential backoff for transient failures (429s, 5xxs)
+- [x] **Retry / rate-limit handling** — exponential backoff via `_retry()`, configurable `max_retries` param
 - [ ] **Response metadata** — expose token usage, model name, and stop reason alongside the text
 - [ ] **Async variants** — `async complete()` for use in async codebases
-- [ ] **Logging** — add `logging.getLogger(__name__)` calls for debugging provider selection, requests, and errors
+- [x] **Logging** — `logging.getLogger(__name__)` for provider selection, requests, and retries
 
 ## Low Priority / Nice-to-Have
 
