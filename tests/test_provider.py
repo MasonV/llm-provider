@@ -5,7 +5,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from llm_provider import AIProvider, ClaudeProvider, OllamaProvider, get_provider
+from llm_provider import (
+    AIProvider,
+    ClaudeProvider,
+    CompletionResult,
+    CompletionStream,
+    CompletionUsage,
+    OllamaProvider,
+    OpenAIProvider,
+    get_provider,
+)
 from llm_provider.provider import _retry
 
 
@@ -24,6 +33,79 @@ class _StubProvider(AIProvider):
 
 
 # ---------------------------------------------------------------------------
+# CompletionResult / CompletionUsage
+# ---------------------------------------------------------------------------
+
+class TestCompletionResult:
+    def test_is_str(self) -> None:
+        r = CompletionResult("hello")
+        assert isinstance(r, str)
+
+    def test_equality(self) -> None:
+        assert CompletionResult("hello") == "hello"
+
+    def test_metadata_accessible(self) -> None:
+        usage = CompletionUsage(prompt_tokens=10, completion_tokens=20)
+        r = CompletionResult("hi", usage=usage, model="m1", stop_reason="end_turn")
+        assert r.usage == usage
+        assert r.usage.prompt_tokens == 10
+        assert r.usage.completion_tokens == 20
+        assert r.model == "m1"
+        assert r.stop_reason == "end_turn"
+
+    def test_defaults(self) -> None:
+        r = CompletionResult("hi")
+        assert r.usage is None
+        assert r.model == ""
+        assert r.stop_reason is None
+
+    def test_string_operations(self) -> None:
+        r = CompletionResult("hello world", model="m1")
+        assert r.upper() == "HELLO WORLD"
+        assert r.split() == ["hello", "world"]
+        assert len(r) == 11
+
+
+# ---------------------------------------------------------------------------
+# CompletionStream
+# ---------------------------------------------------------------------------
+
+class TestCompletionStream:
+    def test_yields_chunks(self) -> None:
+        stream = CompletionStream(iter(["hello ", "world"]))
+        chunks = list(stream)
+        assert chunks == ["hello ", "world"]
+
+    def test_result_after_exhaustion(self) -> None:
+        stream = CompletionStream(iter(["a", "b", "c"]), model="test-model")
+        list(stream)  # exhaust
+        r = stream.result
+        assert r == "abc"
+        assert r.model == "test-model"
+
+    def test_result_auto_consumes(self) -> None:
+        stream = CompletionStream(iter(["hello"]))
+        r = stream.result
+        assert r == "hello"
+
+    def test_finalizer(self) -> None:
+        def _fin(text: str) -> CompletionResult:
+            return CompletionResult(text, model="fin-model", stop_reason="stop")
+
+        stream = CompletionStream(iter(["x", "y"]), finalizer=_fin)
+        list(stream)
+        assert stream.result.model == "fin-model"
+        assert stream.result.stop_reason == "stop"
+
+    def test_default_stream_from_abc(self) -> None:
+        p = _StubProvider("full text")
+        stream = p.stream("s", "u")
+        chunks = list(stream)
+        assert chunks == ["full text"]
+        assert stream.result == "full text"
+
+
+# ---------------------------------------------------------------------------
 # get_provider factory
 # ---------------------------------------------------------------------------
 
@@ -37,6 +119,16 @@ class TestGetProvider:
     def test_ollama(self, mock_cls: MagicMock) -> None:
         get_provider("ollama", ollama_base_url="http://host:1234", ollama_model="m1")
         mock_cls.assert_called_once_with(base_url="http://host:1234", model="m1")
+
+    @patch("llm_provider.provider.OpenAIProvider")
+    def test_openai(self, mock_cls: MagicMock) -> None:
+        get_provider("openai", api_key="sk-test", openai_model="gpt-4o")
+        mock_cls.assert_called_once_with(api_key="sk-test", model="gpt-4o")
+
+    @patch("llm_provider.provider.OpenAIProvider")
+    def test_openai_default_model(self, mock_cls: MagicMock) -> None:
+        get_provider("openai", api_key="sk-test")
+        mock_cls.assert_called_once_with(api_key="sk-test", model="gpt-4o-mini")
 
     def test_unknown_raises(self) -> None:
         with pytest.raises(ValueError, match="Unknown AI provider"):
@@ -65,15 +157,52 @@ class TestClaudeProvider:
         mock_anthropic.Anthropic.return_value = mock_client
         mock_msg = MagicMock()
         mock_msg.content = [MagicMock(text="hello")]
+        mock_msg.usage.input_tokens = 5
+        mock_msg.usage.output_tokens = 3
+        mock_msg.model = "claude-haiku-4-5-20251001"
+        mock_msg.stop_reason = "end_turn"
         mock_client.messages.create.return_value = mock_msg
 
-        # Patch the import inside __init__
         with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
             p = ClaudeProvider(api_key="sk-test")
             result = p.complete("system", "user")
 
         assert result == "hello"
+        assert result.usage.prompt_tokens == 5
+        assert result.usage.completion_tokens == 3
+        assert result.model == "claude-haiku-4-5-20251001"
+        assert result.stop_reason == "end_turn"
         mock_client.messages.create.assert_called_once()
+
+    @patch("llm_provider.provider.anthropic", create=True)
+    def test_stream(self, mock_anthropic: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+
+        # Mock stream context manager
+        mock_stream = MagicMock()
+        mock_stream.text_stream = iter(["hel", "lo"])
+        mock_final = MagicMock()
+        mock_final.content = [MagicMock(text="hello")]
+        mock_final.usage.input_tokens = 4
+        mock_final.usage.output_tokens = 2
+        mock_final.model = "claude-haiku-4-5-20251001"
+        mock_final.stop_reason = "end_turn"
+        mock_stream.get_final_message.return_value = mock_final
+
+        mock_ctx = MagicMock()
+        mock_ctx.__enter__ = MagicMock(return_value=mock_stream)
+        mock_ctx.__exit__ = MagicMock(return_value=False)
+        mock_client.messages.stream.return_value = mock_ctx
+
+        with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
+            p = ClaudeProvider(api_key="sk-test")
+            stream = p.stream("system", "user")
+            chunks = list(stream)
+
+        assert chunks == ["hel", "lo"]
+        assert stream.result == "hello"
+        assert stream.result.usage.prompt_tokens == 4
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +219,13 @@ class TestOllamaProvider:
     def test_complete(self, monkeypatch: pytest.MonkeyPatch) -> None:
         mock_client = MagicMock()
         mock_resp = MagicMock()
-        mock_resp.json.return_value = {"response": "world"}
+        mock_resp.json.return_value = {
+            "response": "world",
+            "model": "llama3",
+            "prompt_eval_count": 8,
+            "eval_count": 5,
+            "done_reason": "stop",
+        }
         mock_resp.raise_for_status = MagicMock()
         mock_client.post.return_value = mock_resp
 
@@ -98,7 +233,24 @@ class TestOllamaProvider:
         result = p.complete("sys", "usr")
 
         assert result == "world"
+        assert result.usage.prompt_tokens == 8
+        assert result.usage.completion_tokens == 5
+        assert result.model == "llama3"
+        assert result.stop_reason == "stop"
         mock_client.post.assert_called_once()
+
+    def test_complete_no_token_counts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"response": "hi", "model": "llama3"}
+        mock_resp.raise_for_status = MagicMock()
+        mock_client.post.return_value = mock_resp
+
+        p = self._make_provider(monkeypatch, mock_client)
+        result = p.complete("sys", "usr")
+
+        assert result == "hi"
+        assert result.usage is None
 
     def test_unreachable(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import httpx
@@ -126,6 +278,64 @@ class TestOllamaProvider:
         p.close()
         p.close()
         mock_client.close.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# OpenAIProvider
+# ---------------------------------------------------------------------------
+
+class TestOpenAIProvider:
+    def test_empty_api_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with pytest.raises(ValueError, match="API key required"):
+            OpenAIProvider(api_key="")
+
+    @patch("llm_provider.provider.openai", create=True)
+    def test_complete(self, mock_openai: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        mock_client = MagicMock()
+        mock_openai.OpenAI.return_value = mock_client
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = "hi there"
+        mock_choice.finish_reason = "stop"
+        mock_resp = MagicMock()
+        mock_resp.choices = [mock_choice]
+        mock_resp.model = "gpt-4o-mini"
+        mock_resp.usage.prompt_tokens = 12
+        mock_resp.usage.completion_tokens = 7
+        mock_client.chat.completions.create.return_value = mock_resp
+
+        with patch.dict("sys.modules", {"openai": mock_openai}):
+            p = OpenAIProvider(api_key="sk-test")
+            result = p.complete("system", "user")
+
+        assert result == "hi there"
+        assert result.usage.prompt_tokens == 12
+        assert result.usage.completion_tokens == 7
+        assert result.model == "gpt-4o-mini"
+        assert result.stop_reason == "stop"
+        mock_client.chat.completions.create.assert_called_once()
+
+    @patch("llm_provider.provider.openai", create=True)
+    def test_complete_no_usage(self, mock_openai: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        mock_client = MagicMock()
+        mock_openai.OpenAI.return_value = mock_client
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = "hi"
+        mock_choice.finish_reason = "stop"
+        mock_resp = MagicMock()
+        mock_resp.choices = [mock_choice]
+        mock_resp.model = "gpt-4o-mini"
+        mock_resp.usage = None
+        mock_client.chat.completions.create.return_value = mock_resp
+
+        with patch.dict("sys.modules", {"openai": mock_openai}):
+            p = OpenAIProvider(api_key="sk-test")
+            result = p.complete("system", "user")
+
+        assert result == "hi"
+        assert result.usage is None
 
 
 # ---------------------------------------------------------------------------

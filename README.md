@@ -1,18 +1,21 @@
 # llm-provider
 
-Minimal pluggable LLM provider abstraction for Python. Supports Claude (Anthropic) and Ollama out of the box.
+Minimal pluggable LLM provider abstraction for Python. Supports Claude (Anthropic), OpenAI, and Ollama out of the box.
 
 ## Install
 
 ```bash
 # Claude only
-pip install "llm-provider[claude] @ git+https://github.com/MasonV/llm-provider.git@v0.2.0"
+pip install "llm-provider[claude] @ git+https://github.com/MasonV/llm-provider.git"
+
+# OpenAI only
+pip install "llm-provider[openai] @ git+https://github.com/MasonV/llm-provider.git"
 
 # Ollama only
-pip install "llm-provider[ollama] @ git+https://github.com/MasonV/llm-provider.git@v0.2.0"
+pip install "llm-provider[ollama] @ git+https://github.com/MasonV/llm-provider.git"
 
-# Both
-pip install "llm-provider[all] @ git+https://github.com/MasonV/llm-provider.git@v0.2.0"
+# All providers
+pip install "llm-provider[all] @ git+https://github.com/MasonV/llm-provider.git"
 ```
 
 ## Quick Start
@@ -21,16 +24,48 @@ pip install "llm-provider[all] @ git+https://github.com/MasonV/llm-provider.git@
 from llm_provider import get_provider
 
 provider = get_provider()  # uses AI_PROVIDER env var, defaults to "claude"
-result = provider.complete_json("Return JSON with a greeting field.", "Say hello.")
-print(result)  # {"greeting": "Hello!"}
+result = provider.complete("Return a greeting.", "Say hello.")
+print(result)  # "Hello!"
+
+# JSON parsing with fence stripping
+data = provider.complete_json("Return JSON with a greeting field.", "Say hello.")
+print(data)  # {"greeting": "Hello!"}
+```
+
+## Response Metadata
+
+Built-in providers return a `CompletionResult` — a `str` subclass that also
+carries token usage, model name, and stop reason:
+
+```python
+result = provider.complete("system prompt", "user message")
+print(result)              # works as a normal string
+print(result.model)        # "claude-haiku-4-5-20251001"
+print(result.stop_reason)  # "end_turn"
+print(result.usage)        # CompletionUsage(prompt_tokens=12, completion_tokens=8)
+```
+
+## Streaming
+
+All providers support streaming via the `stream()` method, which returns a
+`CompletionStream` — an iterator of text chunks:
+
+```python
+stream = provider.stream("system prompt", "user message")
+for chunk in stream:
+    print(chunk, end="", flush=True)
+
+# After the stream is consumed, metadata is available:
+print(stream.result.usage)
 ```
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `AI_PROVIDER` | `"claude"` | Provider to use: `"claude"` or `"ollama"` |
-| `ANTHROPIC_API_KEY` | — | API key for Claude (required for Claude provider) |
+| `AI_PROVIDER` | `"claude"` | Provider to use: `"claude"`, `"openai"`, or `"ollama"` |
+| `ANTHROPIC_API_KEY` | — | API key for Claude |
+| `OPENAI_API_KEY` | — | API key for OpenAI |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
 | `OLLAMA_MODEL` | `llama3` | Ollama model name |
 
@@ -50,7 +85,10 @@ class MyProvider(AIProvider):
 
 provider = MyProvider()
 provider.complete_json("Return JSON.", "Do something.")  # inherited
+provider.stream("sys", "usr")  # inherited (single-chunk fallback)
 ```
+
+Override `stream()` for native streaming support.
 
 ## Resource Cleanup
 
