@@ -1,7 +1,7 @@
 # llm-provider — Development TODO
 
-Extracted from Pillars as a minimal pluggable LLM abstraction (Claude + Ollama).
-Current state: core API works (AIProvider ABC, ClaudeProvider, OllamaProvider, `get_provider()` factory), but lacks tests, docs, and polish.
+Extracted from Pillars as a minimal pluggable LLM abstraction (Claude + OpenAI + Ollama).
+Current state: core API works with three providers, response metadata, and streaming support.
 
 ---
 
@@ -14,15 +14,16 @@ Current state: core API works (AIProvider ABC, ClaudeProvider, OllamaProvider, `
 
 ## Medium Priority
 
-- [ ] **Streaming support** — add an optional `stream=True` path returning an iterator/async generator
+- [x] **Streaming support** — `stream()` method returning `CompletionStream` iterator with `.result` property
 - [x] **Retry / rate-limit handling** — exponential backoff via `_retry()`, configurable `max_retries` param
-- [ ] **Response metadata** — expose token usage, model name, and stop reason alongside the text
+- [x] **Response metadata** — `CompletionResult(str)` subclass exposing `.usage`, `.model`, `.stop_reason`
 - [ ] **Async variants** — `async complete()` for use in async codebases
 - [x] **Logging** — `logging.getLogger(__name__)` for provider selection, requests, and retries
 
 ## Low Priority / Nice-to-Have
 
-- [ ] **Additional providers** — OpenAI, Google Gemini, local llama.cpp, etc.
+- [x] **Additional providers** — OpenAI via `OpenAIProvider`
+- [ ] **More providers** — Google Gemini, local llama.cpp, etc.
 - [ ] **Token counting** — pre-flight token estimation so callers can check limits
 - [ ] **CI pipeline** — GitHub Actions for lint (ruff), type check (mypy), and tests on push
 - [ ] **Publish to PyPI** — automate release from tags
