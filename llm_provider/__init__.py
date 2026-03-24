@@ -6,6 +6,7 @@ from .provider import (
     CompletionUsage,
     OllamaProvider,
     OpenAIProvider,
+    Prompt,
     get_provider,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "CompletionUsage",
     "OllamaProvider",
     "OpenAIProvider",
+    "Prompt",
     "get_provider",
 ]

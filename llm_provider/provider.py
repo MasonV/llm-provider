@@ -6,7 +6,9 @@ import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any, Iterator, TypeVar
+
+T = TypeVar("T")
 
 _log = logging.getLogger(__name__)
 
@@ -28,6 +30,22 @@ def _retry(
             delay = base_delay * 2**attempt
             _log.warning("Attempt %d failed, retrying in %.1fs", attempt + 1, delay)
             time.sleep(delay)
+
+
+# ---------------------------------------------------------------------------
+# Prompt
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Prompt:
+    """A bundled system + user prompt pair.
+
+    Defining prompts as named objects keeps them out of call sites and makes
+    them easy to reuse, test, and version independently of the provider call.
+    """
+
+    system: str
+    user: str
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +164,28 @@ class AIProvider(ABC):
             # Drop closing fence
             raw = raw.rsplit("```", 1)[0]
         return json.loads(raw.strip())
+
+    def complete_model(self, system: str, user: str, model_class: type[T]) -> T:
+        """Call complete_json() and validate the result as a Pydantic BaseModel.
+
+        Requires pydantic: pip install llm-provider[pydantic]
+
+        Raises TypeError if model_class is not a Pydantic BaseModel subclass.
+        Raises ImportError if pydantic is not installed.
+        """
+        try:
+            from pydantic import BaseModel
+        except ImportError:
+            raise ImportError(
+                "Pydantic is required for complete_model — install with: "
+                "pip install 'llm-provider[pydantic]'"
+            ) from None
+        if not (isinstance(model_class, type) and issubclass(model_class, BaseModel)):
+            raise TypeError(
+                f"model_class must be a Pydantic BaseModel subclass, got {model_class!r}"
+            )
+        data = self.complete_json(system, user)
+        return model_class.model_validate(data)
 
     def close(self) -> None:
         """Release resources held by this provider. No-op by default."""

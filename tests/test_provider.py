@@ -13,6 +13,7 @@ from llm_provider import (
     CompletionUsage,
     OllamaProvider,
     OpenAIProvider,
+    Prompt,
     get_provider,
 )
 from llm_provider.provider import _retry
@@ -336,6 +337,69 @@ class TestOpenAIProvider:
 
         assert result == "hi"
         assert result.usage is None
+
+
+# ---------------------------------------------------------------------------
+# Prompt dataclass
+# ---------------------------------------------------------------------------
+
+class TestPrompt:
+    def test_fields(self) -> None:
+        p = Prompt(system="sys", user="usr")
+        assert p.system == "sys"
+        assert p.user == "usr"
+
+    def test_usable_as_kwargs(self) -> None:
+        p = Prompt(system="sys", user="usr")
+        stub = _StubProvider("response")
+        result = stub.complete(p.system, p.user)
+        assert result == "response"
+
+
+# ---------------------------------------------------------------------------
+# complete_model / Pydantic parsing
+# ---------------------------------------------------------------------------
+
+class TestCompleteModel:
+    def test_valid_model(self) -> None:
+        from pydantic import BaseModel
+
+        class Book(BaseModel):
+            title: str
+            author: str
+
+        p = _StubProvider('{"title": "Dune", "author": "Herbert"}')
+        result = p.complete_model("s", "u", Book)
+        assert result.title == "Dune"
+        assert result.author == "Herbert"
+
+    def test_fenced_json_model(self) -> None:
+        from pydantic import BaseModel
+
+        class Item(BaseModel):
+            value: int
+
+        p = _StubProvider('```json\n{"value": 42}\n```')
+        result = p.complete_model("s", "u", Item)
+        assert result.value == 42
+
+    def test_non_basemodel_raises(self) -> None:
+        class NotAModel:
+            pass
+
+        p = _StubProvider("{}")
+        with pytest.raises(TypeError, match="Pydantic BaseModel subclass"):
+            p.complete_model("s", "u", NotAModel)  # type: ignore[arg-type]
+
+    def test_validation_error_propagates(self) -> None:
+        from pydantic import BaseModel, ValidationError
+
+        class Strict(BaseModel):
+            count: int
+
+        p = _StubProvider('{"count": "not-an-int"}')
+        with pytest.raises(ValidationError):
+            p.complete_model("s", "u", Strict)
 
 
 # ---------------------------------------------------------------------------
