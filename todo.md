@@ -17,7 +17,7 @@ Current state: core API works with three providers, response metadata, and strea
 - [x] **Streaming support** — `stream()` method returning `CompletionStream` iterator with `.result` property
 - [x] **Retry / rate-limit handling** — exponential backoff via `_retry()`, configurable `max_retries` param
 - [x] **Response metadata** — `CompletionResult(str)` subclass exposing `.usage`, `.model`, `.stop_reason`
-- [ ] **Async variants** — `async complete()` for use in async codebases
+- [x] **Async variants** — `async complete()`, `async stream()`, `async complete_json()`, `async complete_model()` via `AsyncAIProvider` and `async_provider.py`
 - [x] **Logging** — `logging.getLogger(__name__)` for provider selection, requests, and retries
 
 ## Low Priority / Nice-to-Have

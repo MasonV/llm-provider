@@ -33,6 +33,54 @@ def _retry(
             time.sleep(delay)
 
 
+def _parse_json_response(raw: str) -> dict:
+    """Parse a potentially messy LLM response into a dict.
+
+    Strips markdown code fences, tries json.loads, falls back to brace-depth
+    extraction.  Shared by both sync and async complete_json implementations.
+    """
+    raw = raw.strip()
+    # Strip markdown fences — handles mid-response fences, not just leading
+    cleaned = re.sub(
+        r"^```(?:json)?\n?|```$", "", raw, flags=re.MULTILINE
+    ).strip()
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as first_err:
+        # Fall back: extract the first balanced {...} block
+        block = _extract_json_object(cleaned)
+        if block:
+            try:
+                return json.loads(block)
+            except json.JSONDecodeError:
+                pass
+
+        _log.warning(
+            "complete_json: all parse attempts failed; raw=%.300r", raw
+        )
+        raise first_err
+
+
+def _validate_model_class(model_class: type) -> None:
+    """Validate that model_class is a Pydantic BaseModel subclass.
+
+    Raises ImportError if pydantic is not installed.
+    Raises TypeError if model_class is not a BaseModel subclass.
+    """
+    try:
+        from pydantic import BaseModel
+    except ImportError:
+        raise ImportError(
+            "Pydantic is required for complete_model — install with: "
+            "pip install 'llm-provider[pydantic]'"
+        ) from None
+    if not (isinstance(model_class, type) and issubclass(model_class, BaseModel)):
+        raise TypeError(
+            f"model_class must be a Pydantic BaseModel subclass, got {model_class!r}"
+        )
+
+
 def _extract_json_object(text: str) -> str | None:
     """Extract the first top-level {...} block using brace-depth tracking.
 
@@ -191,32 +239,11 @@ class AIProvider(ABC):
         """Call complete() and parse the result as JSON.
 
         Uses a multi-stage approach to handle messy LLM output:
-        1. Strip markdown code fences (``\u0060json ... ``\u0060)
+        1. Strip markdown code fences
         2. Try json.loads on the cleaned text
         3. Fall back to brace-depth extraction for responses with preamble
         """
-        raw = self.complete(system, user).strip()
-
-        # Strip markdown fences — handles mid-response fences, not just leading
-        cleaned = re.sub(
-            r"^```(?:json)?\n?|```$", "", raw, flags=re.MULTILINE
-        ).strip()
-
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError as first_err:
-            # Fall back: extract the first balanced {...} block
-            block = _extract_json_object(cleaned)
-            if block:
-                try:
-                    return json.loads(block)
-                except json.JSONDecodeError:
-                    pass
-
-            _log.warning(
-                "complete_json: all parse attempts failed; raw=%.300r", raw
-            )
-            raise first_err
+        return _parse_json_response(self.complete(system, user))
 
     def complete_model(self, system: str, user: str, model_class: type[T]) -> T:
         """Call complete_json() and validate the result as a Pydantic BaseModel.
@@ -226,17 +253,7 @@ class AIProvider(ABC):
         Raises TypeError if model_class is not a Pydantic BaseModel subclass.
         Raises ImportError if pydantic is not installed.
         """
-        try:
-            from pydantic import BaseModel
-        except ImportError:
-            raise ImportError(
-                "Pydantic is required for complete_model — install with: "
-                "pip install 'llm-provider[pydantic]'"
-            ) from None
-        if not (isinstance(model_class, type) and issubclass(model_class, BaseModel)):
-            raise TypeError(
-                f"model_class must be a Pydantic BaseModel subclass, got {model_class!r}"
-            )
+        _validate_model_class(model_class)
         data = self.complete_json(system, user)
         return model_class.model_validate(data)
 
@@ -270,7 +287,8 @@ class ClaudeProvider(AIProvider):
         self._max_tokens = max_tokens
         self._max_retries = max_retries
 
-    def _make_result(self, msg: Any) -> CompletionResult:
+    @staticmethod
+    def _make_result(msg: Any) -> CompletionResult:
         usage = CompletionUsage(
             prompt_tokens=msg.usage.input_tokens,
             completion_tokens=msg.usage.output_tokens,
@@ -294,7 +312,7 @@ class ClaudeProvider(AIProvider):
                 system=system,
                 messages=[{"role": "user", "content": user}],
             )
-            return self._make_result(msg)
+            return ClaudeProvider._make_result(msg)
 
         if self._max_retries <= 0:
             result = _call()
@@ -326,7 +344,7 @@ class ClaudeProvider(AIProvider):
 
         def _finalizer(text: str) -> CompletionResult:
             msg = managed_stream.get_final_message()
-            return self._make_result(msg)
+            return ClaudeProvider._make_result(msg)
 
         return CompletionStream(_chunks(), model=self._model, finalizer=_finalizer)
 
@@ -344,14 +362,15 @@ class OllamaProvider(AIProvider):
         self._client: httpx.Client | None = httpx.Client(timeout=60.0)
         self._max_retries = max_retries
 
-    def _make_result(self, text: str, data: dict) -> CompletionResult:
+    @staticmethod
+    def _make_result(text: str, data: dict, fallback_model: str = "") -> CompletionResult:
         prompt_tokens = data.get("prompt_eval_count", 0)
         completion_tokens = data.get("eval_count", 0)
         usage = CompletionUsage(prompt_tokens, completion_tokens) if prompt_tokens or completion_tokens else None
         return CompletionResult(
             text,
             usage=usage,
-            model=data.get("model", self._model),
+            model=data.get("model", fallback_model),
             stop_reason=data.get("done_reason"),
         )
 
@@ -373,7 +392,7 @@ class OllamaProvider(AIProvider):
                 ) from None
             response.raise_for_status()
             data = response.json()
-            return self._make_result(data["response"], data)
+            return OllamaProvider._make_result(data["response"], data, self._model)
 
         if self._max_retries <= 0:
             result = _call()
@@ -413,7 +432,7 @@ class OllamaProvider(AIProvider):
                 ) from None
 
         def _finalizer(text: str) -> CompletionResult:
-            return self._make_result(text, final_data)
+            return OllamaProvider._make_result(text, final_data, self._model)
 
         return CompletionStream(_chunks(), model=self._model, finalizer=_finalizer)
 
@@ -446,7 +465,8 @@ class OpenAIProvider(AIProvider):
         self._max_tokens = max_tokens
         self._max_retries = max_retries
 
-    def _make_result(self, response: Any) -> CompletionResult:
+    @staticmethod
+    def _make_result(response: Any) -> CompletionResult:
         choice = response.choices[0]
         usage = None
         if response.usage:
@@ -475,7 +495,7 @@ class OpenAIProvider(AIProvider):
                     {"role": "user", "content": user},
                 ],
             )
-            return self._make_result(response)
+            return OpenAIProvider._make_result(response)
 
         if self._max_retries <= 0:
             result = _call()

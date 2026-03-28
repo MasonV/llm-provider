@@ -10,8 +10,22 @@ from .provider import (
     get_provider,
 )
 
+from .async_provider import (
+    AsyncAIProvider,
+    AsyncClaudeProvider,
+    AsyncCompletionStream,
+    AsyncOllamaProvider,
+    AsyncOpenAIProvider,
+    get_async_provider,
+)
+
 __all__ = [
     "AIProvider",
+    "AsyncAIProvider",
+    "AsyncClaudeProvider",
+    "AsyncCompletionStream",
+    "AsyncOllamaProvider",
+    "AsyncOpenAIProvider",
     "ClaudeProvider",
     "CompletionResult",
     "CompletionStream",
@@ -19,5 +33,6 @@ __all__ = [
     "OllamaProvider",
     "OpenAIProvider",
     "Prompt",
+    "get_async_provider",
     "get_provider",
 ]

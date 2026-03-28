@@ -59,6 +59,51 @@ for chunk in stream:
 print(stream.result.usage)
 ```
 
+## Async Support
+
+All providers have async variants for use with `asyncio`:
+
+```python
+import asyncio
+from llm_provider import get_async_provider
+
+async def main():
+    async with get_async_provider() as provider:
+        result = await provider.complete("Return a greeting.", "Say hello.")
+        print(result)
+
+        # JSON parsing works the same way
+        data = await provider.complete_json("Return JSON.", "Say hello.")
+        print(data)
+
+asyncio.run(main())
+```
+
+### Async Streaming
+
+```python
+stream = await provider.stream("system prompt", "user message")
+async for chunk in stream:
+    print(chunk, end="", flush=True)
+
+# Metadata available after consumption
+result = await stream.get_result()
+print(result.usage)
+```
+
+### Custom Async Provider
+
+Subclass `AsyncAIProvider` and implement `complete()`:
+
+```python
+from llm_provider import AsyncAIProvider
+
+class MyAsyncProvider(AsyncAIProvider):
+    async def complete(self, system: str, user: str) -> str:
+        # call your async LLM client here
+        return "response text"
+```
+
 ## Environment Variables
 
 | Variable | Default | Description |
