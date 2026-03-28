@@ -16,7 +16,7 @@ from llm_provider import (
     Prompt,
     get_provider,
 )
-from llm_provider.provider import _retry
+from llm_provider.provider import _extract_json_object, _retry
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +427,64 @@ class TestCompleteJson:
     def test_whitespace_padding(self) -> None:
         p = _StubProvider('  \n{"key": "value"}\n  ')
         assert p.complete_json("s", "u") == {"key": "value"}
+
+    def test_preamble_then_json(self) -> None:
+        p = _StubProvider('Sure, here is the JSON:\n{"key": "value"}')
+        assert p.complete_json("s", "u") == {"key": "value"}
+
+    def test_preamble_then_fenced(self) -> None:
+        p = _StubProvider('Here you go:\n```json\n{"key": "value"}\n```')
+        assert p.complete_json("s", "u") == {"key": "value"}
+
+    def test_nested_braces(self) -> None:
+        p = _StubProvider('{"task": "test", "meta": {"source": "ai"}}')
+        result = p.complete_json("s", "u")
+        assert result["task"] == "test"
+        assert result["meta"]["source"] == "ai"
+
+    def test_multiline_notes_in_fences(self) -> None:
+        """The real-world case: bullet-point notes inside fenced JSON."""
+        payload = {
+            "task": "Fix the sink",
+            "notes": "- Turn off water supply\n- Check washer\n- Have plumber's tape ready",
+        }
+        raw = f"Sure, here is the JSON:\n```json\n{json.dumps(payload, indent=2)}\n```"
+        p = _StubProvider(raw)
+        result = p.complete_json("s", "u")
+        assert result["task"] == "Fix the sink"
+        assert "washer" in result["notes"]
+
+    def test_unbalanced_braces_raises(self) -> None:
+        p = _StubProvider('{"key": "value"')
+        with pytest.raises(json.JSONDecodeError):
+            p.complete_json("s", "u")
+
+
+# ---------------------------------------------------------------------------
+# _extract_json_object
+# ---------------------------------------------------------------------------
+
+
+class TestExtractJsonObject:
+    def test_simple(self) -> None:
+        assert _extract_json_object('{"key": "value"}') == '{"key": "value"}'
+
+    def test_nested(self) -> None:
+        text = 'Here is the result: {"task": "Buy groceries", "meta": {"source": "ai"}}'
+        result = _extract_json_object(text)
+        parsed = json.loads(result)
+        assert parsed["task"] == "Buy groceries"
+        assert parsed["meta"]["source"] == "ai"
+
+    def test_escaped_quotes(self) -> None:
+        text = r'{"notes": "Use \"organic\" if possible"}'
+        result = _extract_json_object(text)
+        assert result is not None
+        parsed = json.loads(result)
+        assert "organic" in parsed["notes"]
+
+    def test_no_json(self) -> None:
+        assert _extract_json_object("no json here") is None
 
 
 # ---------------------------------------------------------------------------
