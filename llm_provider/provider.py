@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -30,6 +31,41 @@ def _retry(
             delay = base_delay * 2**attempt
             _log.warning("Attempt %d failed, retrying in %.1fs", attempt + 1, delay)
             time.sleep(delay)
+
+
+def _extract_json_object(text: str) -> str | None:
+    """Extract the first top-level {...} block using brace-depth tracking.
+
+    Handles nested braces, quoted strings (with escaped quotes), and
+    multi-line values — unlike a simple regex which breaks on nested objects.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -154,16 +190,33 @@ class AIProvider(ABC):
     def complete_json(self, system: str, user: str) -> dict:
         """Call complete() and parse the result as JSON.
 
-        Strips markdown code fences (```json ... ```) if present,
-        since some models wrap JSON in fences even when asked not to.
+        Uses a multi-stage approach to handle messy LLM output:
+        1. Strip markdown code fences (``\u0060json ... ``\u0060)
+        2. Try json.loads on the cleaned text
+        3. Fall back to brace-depth extraction for responses with preamble
         """
         raw = self.complete(system, user).strip()
-        if raw.startswith("```"):
-            # Drop opening fence line (e.g. "```json")
-            raw = raw.split("\n", 1)[1] if "\n" in raw else raw
-            # Drop closing fence
-            raw = raw.rsplit("```", 1)[0]
-        return json.loads(raw.strip())
+
+        # Strip markdown fences — handles mid-response fences, not just leading
+        cleaned = re.sub(
+            r"^```(?:json)?\n?|```$", "", raw, flags=re.MULTILINE
+        ).strip()
+
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError as first_err:
+            # Fall back: extract the first balanced {...} block
+            block = _extract_json_object(cleaned)
+            if block:
+                try:
+                    return json.loads(block)
+                except json.JSONDecodeError:
+                    pass
+
+            _log.warning(
+                "complete_json: all parse attempts failed; raw=%.300r", raw
+            )
+            raise first_err
 
     def complete_model(self, system: str, user: str, model_class: type[T]) -> T:
         """Call complete_json() and validate the result as a Pydantic BaseModel.
