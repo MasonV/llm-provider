@@ -19,6 +19,14 @@ from llm_provider import (
 from llm_provider.provider import _extract_json_object, _retry
 
 
+def _has_openai() -> bool:
+    try:
+        import openai  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -121,6 +129,16 @@ class TestGetProvider:
         get_provider("ollama", ollama_base_url="http://host:1234", ollama_model="m1")
         mock_cls.assert_called_once_with(base_url="http://host:1234", model="m1")
 
+    @patch("llm_provider.provider.OllamaProvider")
+    def test_ollama_with_timeout(self, mock_cls: MagicMock) -> None:
+        get_provider("ollama", ollama_base_url="http://host:1234", ollama_model="m1", ollama_timeout=300.0)
+        mock_cls.assert_called_once_with(base_url="http://host:1234", model="m1", timeout=300.0)
+
+    @patch("llm_provider.provider.OllamaProvider")
+    def test_ollama_with_think(self, mock_cls: MagicMock) -> None:
+        get_provider("ollama", ollama_model="m1", ollama_think=False)
+        mock_cls.assert_called_once_with(base_url="", model="m1", think=False)
+
     @patch("llm_provider.provider.OpenAIProvider")
     def test_openai(self, mock_cls: MagicMock) -> None:
         get_provider("openai", api_key="sk-test", openai_model="gpt-4o")
@@ -221,7 +239,7 @@ class TestOllamaProvider:
         mock_client = MagicMock()
         mock_resp = MagicMock()
         mock_resp.json.return_value = {
-            "response": "world",
+            "message": {"role": "assistant", "content": "world"},
             "model": "llama3",
             "prompt_eval_count": 8,
             "eval_count": 5,
@@ -240,10 +258,34 @@ class TestOllamaProvider:
         assert result.stop_reason == "stop"
         mock_client.post.assert_called_once()
 
+    def test_complete_sends_chat_messages(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "message": {"role": "assistant", "content": "ok"},
+            "model": "llama3",
+        }
+        mock_resp.raise_for_status = MagicMock()
+        mock_client.post.return_value = mock_resp
+
+        p = self._make_provider(monkeypatch, mock_client)
+        p.complete("system prompt", "user prompt")
+
+        call_args = mock_client.post.call_args
+        assert "/api/chat" in call_args[0][0]
+        payload = call_args[1]["json"]
+        assert payload["messages"] == [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "user prompt"},
+        ]
+
     def test_complete_no_token_counts(self, monkeypatch: pytest.MonkeyPatch) -> None:
         mock_client = MagicMock()
         mock_resp = MagicMock()
-        mock_resp.json.return_value = {"response": "hi", "model": "llama3"}
+        mock_resp.json.return_value = {
+            "message": {"role": "assistant", "content": "hi"},
+            "model": "llama3",
+        }
         mock_resp.raise_for_status = MagicMock()
         mock_client.post.return_value = mock_resp
 
@@ -280,11 +322,104 @@ class TestOllamaProvider:
         p.close()
         mock_client.close.assert_called_once()
 
+    def test_custom_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        captured_kwargs: dict = {}
+        original_client = httpx.Client
+
+        def _capture_client(**kw: object) -> MagicMock:
+            captured_kwargs.update(kw)
+            return MagicMock()
+
+        monkeypatch.setattr(httpx, "Client", _capture_client)
+        p = OllamaProvider(base_url="http://localhost:11434", model="llama3", timeout=300.0)
+        assert captured_kwargs["timeout"] == 300.0
+        assert p._timeout == 300.0
+
+    def test_default_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        captured_kwargs: dict = {}
+
+        def _capture_client(**kw: object) -> MagicMock:
+            captured_kwargs.update(kw)
+            return MagicMock()
+
+        monkeypatch.setattr(httpx, "Client", _capture_client)
+        OllamaProvider(base_url="http://localhost:11434", model="llama3")
+        assert captured_kwargs["timeout"] == 120.0
+
+    def test_timeout_is_retryable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        monkeypatch.setattr("llm_provider.provider.time.sleep", lambda _: None)
+        mock_client = MagicMock()
+        call_count = 0
+
+        def _post(*args: object, **kwargs: object) -> MagicMock:
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise httpx.ReadTimeout("timed out")
+            resp = MagicMock()
+            resp.json.return_value = {
+                "message": {"role": "assistant", "content": "ok"},
+                "model": "llama3",
+            }
+            resp.raise_for_status = MagicMock()
+            return resp
+
+        mock_client.post.side_effect = _post
+        monkeypatch.setattr(httpx, "Client", lambda **kw: mock_client)
+        p = OllamaProvider(base_url="http://localhost:11434", model="llama3")
+        result = p.complete("sys", "usr")
+        assert result == "ok"
+        assert call_count == 3
+
+    def test_think_parameter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "message": {"role": "assistant", "content": "ok"},
+            "model": "llama3",
+        }
+        mock_resp.raise_for_status = MagicMock()
+        mock_client.post.return_value = mock_resp
+
+        monkeypatch.setattr("httpx.Client", lambda **kw: mock_client)
+        p = OllamaProvider(base_url="http://localhost:11434", model="llama3", think=False)
+        p.complete("sys", "usr")
+
+        payload = mock_client.post.call_args[1]["json"]
+        assert payload["think"] is False
+
+    def test_think_omitted_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "message": {"role": "assistant", "content": "ok"},
+            "model": "llama3",
+        }
+        mock_resp.raise_for_status = MagicMock()
+        mock_client.post.return_value = mock_resp
+
+        monkeypatch.setattr("httpx.Client", lambda **kw: mock_client)
+        p = OllamaProvider(base_url="http://localhost:11434", model="llama3")
+        p.complete("sys", "usr")
+
+        payload = mock_client.post.call_args[1]["json"]
+        assert "think" not in payload
+
 
 # ---------------------------------------------------------------------------
 # OpenAIProvider
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(
+    not _has_openai(),
+    reason="openai package not installed",
+)
 class TestOpenAIProvider:
     def test_empty_api_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)

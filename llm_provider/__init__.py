@@ -1,3 +1,5 @@
+from .events import CompletionCallback, CompletionEvent
+
 from .provider import (
     AIProvider,
     ClaudeProvider,
@@ -27,6 +29,8 @@ __all__ = [
     "AsyncOllamaProvider",
     "AsyncOpenAIProvider",
     "ClaudeProvider",
+    "CompletionCallback",
+    "CompletionEvent",
     "CompletionResult",
     "CompletionStream",
     "CompletionUsage",

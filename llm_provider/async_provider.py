@@ -10,9 +10,11 @@ import asyncio
 import json
 import logging
 import os
+import time
 from abc import ABC, abstractmethod
 from typing import Any, AsyncIterator, TypeVar
 
+from .events import CompletionCallback, CompletionEvent
 from .provider import (
     ClaudeProvider,
     CompletionResult,
@@ -40,16 +42,32 @@ async def _async_retry(
     max_attempts: int = 3,
     base_delay: float = 1.0,
     retryable: tuple[type[Exception], ...],
+    callback: CompletionCallback | None = None,
+    provider_name: str = "",
+    model_name: str = "",
+    context: dict | None = None,
 ) -> Any:
     """Call awaitable *fn()* with exponential backoff on retryable exceptions."""
     for attempt in range(max_attempts):
         try:
             return await fn()
-        except retryable:
+        except retryable as exc:
             if attempt + 1 == max_attempts:
                 raise
             delay = base_delay * 2**attempt
-            _log.warning("Attempt %d failed, retrying in %.1fs", attempt + 1, delay)
+            _log.warning(
+                "Attempt %d failed (%s), retrying in %.1fs",
+                attempt + 1, exc, delay,
+            )
+            if callback:
+                callback(CompletionEvent(
+                    phase="retry",
+                    provider=provider_name,
+                    model=model_name,
+                    error=str(exc),
+                    attempt=attempt + 1,
+                    context=context,
+                ))
             await asyncio.sleep(delay)
 
 
@@ -111,6 +129,23 @@ class AsyncCompletionStream:
 # ---------------------------------------------------------------------------
 
 class AsyncAIProvider(ABC):
+    _callback: CompletionCallback | None = None
+    _context: dict | None = None
+
+    def set_callback(
+        self,
+        callback: CompletionCallback | None,
+        context: dict | None = None,
+    ) -> None:
+        """Register an optional event callback for observability."""
+        self._callback = callback
+        self._context = context
+
+    def _emit(self, event: CompletionEvent) -> None:
+        """Dispatch *event* to the registered callback, if any."""
+        if self._callback:
+            self._callback(event)
+
     @abstractmethod
     async def complete(self, system: str, user: str) -> str: ...
 
@@ -186,7 +221,12 @@ class AsyncClaudeProvider(AsyncAIProvider):
     async def complete(self, system: str, user: str) -> str:
         import anthropic
 
-        _log.debug("AsyncClaude request: model=%s, max_tokens=%d", self._model, self._max_tokens)
+        _log.info("AsyncClaude request: model=%s, max_tokens=%d", self._model, self._max_tokens)
+        self._emit(CompletionEvent(
+            phase="start", provider="claude", model=self._model,
+            context=self._context,
+        ))
+        t0 = time.monotonic()
 
         async def _call() -> CompletionResult:
             msg = await self._client.messages.create(
@@ -197,19 +237,46 @@ class AsyncClaudeProvider(AsyncAIProvider):
             )
             return ClaudeProvider._make_result(msg)
 
-        if self._max_retries <= 0:
-            result = await _call()
-        else:
-            result = await _async_retry(
-                _call,
-                max_attempts=self._max_retries,
-                retryable=(anthropic.RateLimitError, anthropic.InternalServerError),
-            )
-        _log.debug("AsyncClaude response: %d chars", len(result))
+        try:
+            if self._max_retries <= 0:
+                result = await _call()
+            else:
+                result = await _async_retry(
+                    _call,
+                    max_attempts=self._max_retries,
+                    retryable=(anthropic.RateLimitError, anthropic.InternalServerError),
+                    callback=self._callback,
+                    provider_name="claude",
+                    model_name=self._model,
+                    context=self._context,
+                )
+        except Exception as exc:
+            elapsed = (time.monotonic() - t0) * 1000
+            _log.warning("AsyncClaude request failed after %.0fms: %s", elapsed, exc)
+            self._emit(CompletionEvent(
+                phase="error", provider="claude", model=self._model,
+                elapsed_ms=elapsed, error=str(exc), context=self._context,
+            ))
+            raise
+
+        elapsed = (time.monotonic() - t0) * 1000
+        _log.info(
+            "AsyncClaude response: %d chars, %.0fms, %s/%s tokens",
+            len(result), elapsed,
+            result.usage.prompt_tokens if result.usage else "?",
+            result.usage.completion_tokens if result.usage else "?",
+        )
+        self._emit(CompletionEvent(
+            phase="end", provider="claude", model=self._model,
+            elapsed_ms=elapsed,
+            prompt_tokens=result.usage.prompt_tokens if result.usage else None,
+            completion_tokens=result.usage.completion_tokens if result.usage else None,
+            context=self._context,
+        ))
         return result
 
     async def stream(self, system: str, user: str) -> AsyncCompletionStream:
-        _log.debug("AsyncClaude stream: model=%s, max_tokens=%d", self._model, self._max_tokens)
+        _log.info("AsyncClaude stream: model=%s, max_tokens=%d", self._model, self._max_tokens)
 
         stream_ctx = self._client.messages.stream(
             model=self._model,
@@ -235,28 +302,54 @@ class AsyncClaudeProvider(AsyncAIProvider):
 
 class AsyncOllamaProvider(AsyncAIProvider):
     def __init__(
-        self, base_url: str = "", model: str = "", max_retries: int = 3
+        self,
+        base_url: str = "",
+        model: str = "",
+        max_retries: int = 3,
+        timeout: float = 120.0,
+        think: bool | None = None,
     ) -> None:
         import httpx
 
         self._base_url = base_url or os.environ.get(
             "OLLAMA_BASE_URL", "http://localhost:11434"
         )
-        self._model = model or os.environ.get("OLLAMA_MODEL", "llama3")
-        self._client: httpx.AsyncClient | None = httpx.AsyncClient(timeout=60.0)
+        self._model = model or os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+        self._timeout = timeout
+        self._think = think
+        self._client: httpx.AsyncClient | None = httpx.AsyncClient(timeout=timeout)
         self._max_retries = max_retries
+
+    def _chat_payload(self, system: str, user: str, stream: bool) -> dict[str, Any]:
+        """Build the /api/chat request body."""
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": user})
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "stream": stream,
+        }
+        if self._think is not None:
+            payload["think"] = self._think
+        return payload
 
     async def complete(self, system: str, user: str) -> str:
         import httpx
 
-        _log.debug("AsyncOllama request: model=%s, url=%s", self._model, self._base_url)
-        prompt = f"{system}\n\n{user}"
+        _log.info("AsyncOllama request: model=%s, url=%s", self._model, self._base_url)
+        self._emit(CompletionEvent(
+            phase="start", provider="ollama", model=self._model,
+            context=self._context,
+        ))
+        t0 = time.monotonic()
 
         async def _call() -> CompletionResult:
             try:
                 response = await self._client.post(
-                    f"{self._base_url}/api/generate",
-                    json={"model": self._model, "prompt": prompt, "stream": False},
+                    f"{self._base_url}/api/chat",
+                    json=self._chat_payload(system, user, stream=False),
                 )
             except httpx.ConnectError:
                 raise ConnectionError(
@@ -264,38 +357,67 @@ class AsyncOllamaProvider(AsyncAIProvider):
                 ) from None
             response.raise_for_status()
             data = response.json()
-            return OllamaProvider._make_result(data["response"], data, self._model)
+            text = OllamaProvider._extract_content(data.get("message", {}))
+            return OllamaProvider._make_result(text, data, self._model)
 
-        if self._max_retries <= 0:
-            result = await _call()
-        else:
-            result = await _async_retry(
-                _call,
-                max_attempts=self._max_retries,
-                retryable=(ConnectionError, httpx.HTTPStatusError),
-            )
-        _log.debug("AsyncOllama response: %d chars", len(result))
+        try:
+            if self._max_retries <= 0:
+                result = await _call()
+            else:
+                result = await _async_retry(
+                    _call,
+                    max_attempts=self._max_retries,
+                    retryable=(ConnectionError, httpx.HTTPStatusError, httpx.TimeoutException),
+                    callback=self._callback,
+                    provider_name="ollama",
+                    model_name=self._model,
+                    context=self._context,
+                )
+        except Exception as exc:
+            elapsed = (time.monotonic() - t0) * 1000
+            _log.warning("AsyncOllama request failed after %.0fms: %s", elapsed, exc)
+            self._emit(CompletionEvent(
+                phase="error", provider="ollama", model=self._model,
+                elapsed_ms=elapsed, error=str(exc), context=self._context,
+            ))
+            raise
+
+        elapsed = (time.monotonic() - t0) * 1000
+        _log.info(
+            "AsyncOllama response: %d chars, %.0fms, %s/%s tokens",
+            len(result), elapsed,
+            result.usage.prompt_tokens if result.usage else "?",
+            result.usage.completion_tokens if result.usage else "?",
+        )
+        self._emit(CompletionEvent(
+            phase="end", provider="ollama", model=self._model,
+            elapsed_ms=elapsed,
+            prompt_tokens=result.usage.prompt_tokens if result.usage else None,
+            completion_tokens=result.usage.completion_tokens if result.usage else None,
+            context=self._context,
+        ))
         return result
 
     async def stream(self, system: str, user: str) -> AsyncCompletionStream:
         import httpx
 
-        _log.debug("AsyncOllama stream: model=%s, url=%s", self._model, self._base_url)
-        prompt = f"{system}\n\n{user}"
+        _log.info("AsyncOllama stream: model=%s, url=%s", self._model, self._base_url)
         final_data: dict[str, Any] = {}
 
         async def _chunks() -> AsyncIterator[str]:
             try:
                 async with self._client.stream(
                     "POST",
-                    f"{self._base_url}/api/generate",
-                    json={"model": self._model, "prompt": prompt, "stream": True},
+                    f"{self._base_url}/api/chat",
+                    json=self._chat_payload(system, user, stream=True),
                 ) as response:
                     response.raise_for_status()
                     async for line in response.aiter_lines():
                         data = json.loads(line)
-                        if data.get("response"):
-                            yield data["response"]
+                        msg = data.get("message", {})
+                        content = msg.get("content", "")
+                        if content:
+                            yield content
                         if data.get("done"):
                             final_data.update(data)
             except httpx.ConnectError:
@@ -337,7 +459,12 @@ class AsyncOpenAIProvider(AsyncAIProvider):
     async def complete(self, system: str, user: str) -> str:
         import openai
 
-        _log.debug("AsyncOpenAI request: model=%s, max_tokens=%d", self._model, self._max_tokens)
+        _log.info("AsyncOpenAI request: model=%s, max_tokens=%d", self._model, self._max_tokens)
+        self._emit(CompletionEvent(
+            phase="start", provider="openai", model=self._model,
+            context=self._context,
+        ))
+        t0 = time.monotonic()
 
         async def _call() -> CompletionResult:
             response = await self._client.chat.completions.create(
@@ -350,19 +477,46 @@ class AsyncOpenAIProvider(AsyncAIProvider):
             )
             return OpenAIProvider._make_result(response)
 
-        if self._max_retries <= 0:
-            result = await _call()
-        else:
-            result = await _async_retry(
-                _call,
-                max_attempts=self._max_retries,
-                retryable=(openai.RateLimitError, openai.InternalServerError),
-            )
-        _log.debug("AsyncOpenAI response: %d chars", len(result))
+        try:
+            if self._max_retries <= 0:
+                result = await _call()
+            else:
+                result = await _async_retry(
+                    _call,
+                    max_attempts=self._max_retries,
+                    retryable=(openai.RateLimitError, openai.InternalServerError),
+                    callback=self._callback,
+                    provider_name="openai",
+                    model_name=self._model,
+                    context=self._context,
+                )
+        except Exception as exc:
+            elapsed = (time.monotonic() - t0) * 1000
+            _log.warning("AsyncOpenAI request failed after %.0fms: %s", elapsed, exc)
+            self._emit(CompletionEvent(
+                phase="error", provider="openai", model=self._model,
+                elapsed_ms=elapsed, error=str(exc), context=self._context,
+            ))
+            raise
+
+        elapsed = (time.monotonic() - t0) * 1000
+        _log.info(
+            "AsyncOpenAI response: %d chars, %.0fms, %s/%s tokens",
+            len(result), elapsed,
+            result.usage.prompt_tokens if result.usage else "?",
+            result.usage.completion_tokens if result.usage else "?",
+        )
+        self._emit(CompletionEvent(
+            phase="end", provider="openai", model=self._model,
+            elapsed_ms=elapsed,
+            prompt_tokens=result.usage.prompt_tokens if result.usage else None,
+            completion_tokens=result.usage.completion_tokens if result.usage else None,
+            context=self._context,
+        ))
         return result
 
     async def stream(self, system: str, user: str) -> AsyncCompletionStream:
-        _log.debug("AsyncOpenAI stream: model=%s, max_tokens=%d", self._model, self._max_tokens)
+        _log.info("AsyncOpenAI stream: model=%s, max_tokens=%d", self._model, self._max_tokens)
 
         final_usage: dict[str, int] = {}
 
@@ -401,7 +555,10 @@ def get_async_provider(
     api_key: str = "",
     ollama_base_url: str = "",
     ollama_model: str = "",
+    ollama_timeout: float = 0,
+    ollama_think: bool | None = None,
     openai_model: str = "",
+    callback: CompletionCallback | None = None,
 ) -> AsyncAIProvider:
     """Return an AsyncAIProvider instance.
 
@@ -410,15 +567,28 @@ def get_async_provider(
       2. Environment variables: AI_PROVIDER, ANTHROPIC_API_KEY,
          OPENAI_API_KEY, OLLAMA_BASE_URL, OLLAMA_MODEL
       3. Built-in defaults
+
+    Args:
+        callback: Optional event callback for observability.  Receives a
+            :class:`CompletionEvent` at start, end, error, and retry points.
     """
     name = provider or os.environ.get("AI_PROVIDER", "claude")
-    _log.debug("Using async provider %r", name)
+    _log.info("Using async provider %r", name)
     if name == "claude":
-        return AsyncClaudeProvider(api_key=api_key)
-    if name == "openai":
-        return AsyncOpenAIProvider(api_key=api_key, model=openai_model or "gpt-4o-mini")
-    if name == "ollama":
-        return AsyncOllamaProvider(base_url=ollama_base_url, model=ollama_model)
-    raise ValueError(
-        f"Unknown AI provider: {name!r}. Expected 'claude', 'openai', or 'ollama'."
-    )
+        inst = AsyncClaudeProvider(api_key=api_key)
+    elif name == "openai":
+        inst = AsyncOpenAIProvider(api_key=api_key, model=openai_model or "gpt-4o-mini")
+    elif name == "ollama":
+        kwargs: dict[str, Any] = {"base_url": ollama_base_url, "model": ollama_model}
+        if ollama_timeout > 0:
+            kwargs["timeout"] = ollama_timeout
+        if ollama_think is not None:
+            kwargs["think"] = ollama_think
+        inst = AsyncOllamaProvider(**kwargs)
+    else:
+        raise ValueError(
+            f"Unknown AI provider: {name!r}. Expected 'claude', 'openai', or 'ollama'."
+        )
+    if callback:
+        inst.set_callback(callback)
+    return inst
