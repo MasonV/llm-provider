@@ -159,6 +159,20 @@ class TestGetProvider:
         get_provider()
         mock_cls.assert_called_once()
 
+    @patch("llm_provider.provider.OllamaProvider")
+    def test_from_llm_env(self, mock_cls: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        # LLM env var is the preferred key; AI_PROVIDER is an alias
+        monkeypatch.setenv("LLM", "ollama")
+        get_provider()
+        mock_cls.assert_called_once()
+
+    @patch("llm_provider.provider.OllamaProvider")
+    def test_llm_env_takes_precedence_over_ai_provider(self, mock_cls: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LLM", "ollama")
+        monkeypatch.setenv("AI_PROVIDER", "claude")
+        get_provider()
+        mock_cls.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # ClaudeProvider
