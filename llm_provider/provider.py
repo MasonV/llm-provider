@@ -720,15 +720,18 @@ def get_provider(
 
     Configuration priority (for each setting):
       1. Keyword arguments passed to this function
-      2. Environment variables: AI_PROVIDER, ANTHROPIC_API_KEY,
+      2. Environment variables: LLM, AI_PROVIDER, ANTHROPIC_API_KEY,
          OPENAI_API_KEY, OLLAMA_BASE_URL, OLLAMA_MODEL
       3. Built-in defaults
+
+    ``LLM`` is the preferred env var for provider selection (e.g. ``LLM=ollama``).
+    ``AI_PROVIDER`` is a supported alias for backwards compatibility.
 
     Args:
         callback: Optional event callback for observability.  Receives a
             :class:`CompletionEvent` at start, end, error, and retry points.
     """
-    name = provider or os.environ.get("AI_PROVIDER", "claude")
+    name = provider or os.environ.get("LLM") or os.environ.get("AI_PROVIDER", "claude")
     _log.info("Using provider %r", name)
     if name == "claude":
         inst = ClaudeProvider(api_key=api_key)
