@@ -1,0 +1,779 @@
+from __future__ import annotations
+
+import os
+import subprocess
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from llm_provider import (
+    AgentBackend,
+    AgentConfig,
+    AgentResult,
+    ClaudeCodeAgent,
+    CodexAgent,
+    OllamaCodexAgent,
+    get_agent,
+)
+from llm_provider.agent import (
+    _extract_model,
+    _extract_result_text,
+    _parse_jsonl,
+    _try_parse_json,
+)
+
+
+# ---------------------------------------------------------------------------
+# AgentResult
+# ---------------------------------------------------------------------------
+
+class TestAgentResult:
+    def test_defaults(self) -> None:
+        r = AgentResult(output="done", exit_code=0)
+        assert r.output == "done"
+        assert r.exit_code == 0
+        assert r.model == ""
+        assert r.duration_seconds == 0.0
+        assert r.backend == ""
+        assert r.working_directory == ""
+        assert r.raw_events == []
+        assert r.error is None
+
+    def test_frozen(self) -> None:
+        r = AgentResult(output="ok", exit_code=0)
+        with pytest.raises(AttributeError):
+            r.output = "nope"  # type: ignore[misc]
+
+    def test_full_fields(self) -> None:
+        events = [{"type": "result", "result": "hi"}]
+        r = AgentResult(
+            output="hi",
+            exit_code=0,
+            model="claude-sonnet-4-6",
+            duration_seconds=12.5,
+            backend="claude-code",
+            working_directory="/tmp/work",
+            raw_events=events,
+            error=None,
+        )
+        assert r.model == "claude-sonnet-4-6"
+        assert r.duration_seconds == 12.5
+        assert r.backend == "claude-code"
+        assert r.working_directory == "/tmp/work"
+        assert len(r.raw_events) == 1
+
+
+# ---------------------------------------------------------------------------
+# AgentConfig
+# ---------------------------------------------------------------------------
+
+class TestAgentConfig:
+    def test_defaults(self) -> None:
+        c = AgentConfig()
+        assert c.working_directory == ""
+        assert c.model == ""
+        assert c.max_turns == 0
+        assert c.timeout == 0.0
+        assert c.sandbox == ""
+        assert c.permission_mode == ""
+        assert c.settings_path == ""
+        assert c.use_worktree is False
+        assert c.worktree_path == ""
+        assert c.env == {}
+
+    def test_custom_values(self) -> None:
+        c = AgentConfig(
+            working_directory="/project",
+            model="o3",
+            timeout=300.0,
+            sandbox="workspace-write",
+            use_worktree=True,
+            worktree_path="/tmp/wt",
+            env={"FOO": "bar"},
+        )
+        assert c.working_directory == "/project"
+        assert c.model == "o3"
+        assert c.timeout == 300.0
+        assert c.sandbox == "workspace-write"
+        assert c.use_worktree is True
+        assert c.worktree_path == "/tmp/wt"
+        assert c.env == {"FOO": "bar"}
+
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+class TestTryParseJson:
+    def test_valid_json_dict(self) -> None:
+        assert _try_parse_json('{"key": "val"}') == {"key": "val"}
+
+    def test_empty_string(self) -> None:
+        assert _try_parse_json("") is None
+
+    def test_non_json(self) -> None:
+        assert _try_parse_json("hello world") is None
+
+    def test_json_array_rejected(self) -> None:
+        # Only dicts are returned
+        assert _try_parse_json("[1, 2, 3]") is None
+
+    def test_invalid_json(self) -> None:
+        assert _try_parse_json("{broken") is None
+
+    def test_whitespace_stripped(self) -> None:
+        assert _try_parse_json('  {"a": 1}  ') == {"a": 1}
+
+
+class TestParseJsonl:
+    def test_multiple_lines(self) -> None:
+        text = '{"a": 1}\nnot json\n{"b": 2}\n'
+        result = _parse_jsonl(text)
+        assert result == [{"a": 1}, {"b": 2}]
+
+    def test_empty_input(self) -> None:
+        assert _parse_jsonl("") == []
+
+    def test_no_json_lines(self) -> None:
+        assert _parse_jsonl("line one\nline two\n") == []
+
+
+class TestExtractResultText:
+    def test_single_result_object(self) -> None:
+        events = [{"result": "Task completed successfully"}]
+        assert _extract_result_text(events) == "Task completed successfully"
+
+    def test_multi_event_result_type(self) -> None:
+        events = [
+            {"type": "start", "model": "claude-sonnet-4-6"},
+            {"type": "result", "result": "Done"},
+        ]
+        assert _extract_result_text(events) == "Done"
+
+    def test_assistant_message_type(self) -> None:
+        events = [
+            {"type": "assistant", "message": "First part"},
+            {"type": "assistant", "message": "Second part"},
+        ]
+        assert _extract_result_text(events) == "First part\nSecond part"
+
+    def test_empty_events(self) -> None:
+        assert _extract_result_text([]) == ""
+
+    def test_no_matching_types(self) -> None:
+        events = [{"type": "tool_use", "name": "write"}]
+        assert _extract_result_text(events) == ""
+
+
+class TestExtractModel:
+    def test_finds_model(self) -> None:
+        events = [{"type": "start", "model": "o3"}, {"type": "end"}]
+        assert _extract_model(events) == "o3"
+
+    def test_no_model(self) -> None:
+        events = [{"type": "end"}]
+        assert _extract_model(events) == ""
+
+    def test_empty_events(self) -> None:
+        assert _extract_model([]) == ""
+
+
+# ---------------------------------------------------------------------------
+# ClaudeCodeAgent._build_cmd
+# ---------------------------------------------------------------------------
+
+class TestClaudeCodeBuildCmd:
+    def test_minimal(self) -> None:
+        agent = ClaudeCodeAgent()
+        cmd = agent._build_cmd("do stuff", AgentConfig())
+        assert cmd == ["claude", "-p", "do stuff", "--output-format", "json"]
+
+    def test_working_directory(self) -> None:
+        agent = ClaudeCodeAgent()
+        cfg = AgentConfig(working_directory="/tmp/work")
+        cmd = agent._build_cmd("task", cfg)
+        assert "--cd" in cmd
+        idx = cmd.index("--cd")
+        assert cmd[idx + 1] == "/tmp/work"
+
+    def test_model_from_constructor(self) -> None:
+        agent = ClaudeCodeAgent(model="claude-opus-4-6")
+        cmd = agent._build_cmd("task", AgentConfig())
+        assert "--model" in cmd
+        idx = cmd.index("--model")
+        assert cmd[idx + 1] == "claude-opus-4-6"
+
+    def test_model_from_config(self) -> None:
+        agent = ClaudeCodeAgent()
+        cfg = AgentConfig(model="claude-sonnet-4-6")
+        cmd = agent._build_cmd("task", cfg)
+        assert "--model" in cmd
+        idx = cmd.index("--model")
+        assert cmd[idx + 1] == "claude-sonnet-4-6"
+
+    def test_constructor_model_overrides_config(self) -> None:
+        agent = ClaudeCodeAgent(model="opus")
+        cfg = AgentConfig(model="sonnet")
+        cmd = agent._build_cmd("task", cfg)
+        idx = cmd.index("--model")
+        assert cmd[idx + 1] == "opus"
+
+    def test_max_turns(self) -> None:
+        agent = ClaudeCodeAgent()
+        cfg = AgentConfig(max_turns=10)
+        cmd = agent._build_cmd("task", cfg)
+        assert "--max-turns" in cmd
+        idx = cmd.index("--max-turns")
+        assert cmd[idx + 1] == "10"
+
+    def test_max_turns_zero_omitted(self) -> None:
+        agent = ClaudeCodeAgent()
+        cmd = agent._build_cmd("task", AgentConfig())
+        assert "--max-turns" not in cmd
+
+    def test_sandbox(self) -> None:
+        agent = ClaudeCodeAgent()
+        cfg = AgentConfig(sandbox="workspace-write")
+        cmd = agent._build_cmd("task", cfg)
+        assert "--sandbox" in cmd
+        idx = cmd.index("--sandbox")
+        assert cmd[idx + 1] == "workspace-write"
+
+    def test_permission_mode(self) -> None:
+        agent = ClaudeCodeAgent()
+        cfg = AgentConfig(permission_mode="dontAsk")
+        cmd = agent._build_cmd("task", cfg)
+        assert "--permission-mode" in cmd
+        idx = cmd.index("--permission-mode")
+        assert cmd[idx + 1] == "dontAsk"
+
+    def test_settings_path(self) -> None:
+        agent = ClaudeCodeAgent()
+        cfg = AgentConfig(settings_path="/path/to/settings.json")
+        cmd = agent._build_cmd("task", cfg)
+        assert "--settings" in cmd
+        idx = cmd.index("--settings")
+        assert cmd[idx + 1] == "/path/to/settings.json"
+
+    def test_worktree(self) -> None:
+        agent = ClaudeCodeAgent()
+        cfg = AgentConfig(use_worktree=True)
+        cmd = agent._build_cmd("task", cfg)
+        assert "--worktree" in cmd
+
+    def test_worktree_false_omitted(self) -> None:
+        agent = ClaudeCodeAgent()
+        cmd = agent._build_cmd("task", AgentConfig())
+        assert "--worktree" not in cmd
+
+    def test_full_config(self) -> None:
+        agent = ClaudeCodeAgent(model="claude-sonnet-4-6")
+        cfg = AgentConfig(
+            working_directory="/project",
+            max_turns=5,
+            sandbox="workspace-write",
+            permission_mode="dontAsk",
+            settings_path="/s.json",
+            use_worktree=True,
+        )
+        cmd = agent._build_cmd("build feature", cfg)
+        assert cmd[0] == "claude"
+        assert "-p" in cmd
+        assert "build feature" in cmd
+        assert "--output-format" in cmd
+        assert "--cd" in cmd
+        assert "--model" in cmd
+        assert "--max-turns" in cmd
+        assert "--sandbox" in cmd
+        assert "--permission-mode" in cmd
+        assert "--settings" in cmd
+        assert "--worktree" in cmd
+
+
+# ---------------------------------------------------------------------------
+# CodexAgent._build_cmd
+# ---------------------------------------------------------------------------
+
+class TestCodexBuildCmd:
+    def test_minimal(self) -> None:
+        agent = CodexAgent()
+        cmd = agent._build_cmd("do stuff", AgentConfig())
+        assert cmd == ["codex", "exec", "do stuff", "--json"]
+
+    def test_no_oss_flag(self) -> None:
+        agent = CodexAgent()
+        cmd = agent._build_cmd("task", AgentConfig())
+        assert "--oss" not in cmd
+
+    def test_working_directory(self) -> None:
+        agent = CodexAgent()
+        cfg = AgentConfig(working_directory="/project")
+        cmd = agent._build_cmd("task", cfg)
+        assert "-C" in cmd
+        idx = cmd.index("-C")
+        assert cmd[idx + 1] == "/project"
+
+    def test_model(self) -> None:
+        agent = CodexAgent(model="o3")
+        cmd = agent._build_cmd("task", AgentConfig())
+        assert "-m" in cmd
+        idx = cmd.index("-m")
+        assert cmd[idx + 1] == "o3"
+
+    def test_sandbox(self) -> None:
+        agent = CodexAgent()
+        cfg = AgentConfig(sandbox="read-only")
+        cmd = agent._build_cmd("task", cfg)
+        assert "-s" in cmd
+        idx = cmd.index("-s")
+        assert cmd[idx + 1] == "read-only"
+
+    def test_permission_mode_maps_to_approval(self) -> None:
+        agent = CodexAgent()
+        cfg = AgentConfig(permission_mode="never")
+        cmd = agent._build_cmd("task", cfg)
+        assert "-a" in cmd
+        idx = cmd.index("-a")
+        assert cmd[idx + 1] == "never"
+
+    def test_worktree_uses_worktree_path(self) -> None:
+        agent = CodexAgent()
+        cfg = AgentConfig(
+            working_directory="/project",
+            use_worktree=True,
+            worktree_path="/tmp/worktree",
+        )
+        cmd = agent._build_cmd("task", cfg)
+        assert "-C" in cmd
+        idx = cmd.index("-C")
+        # Worktree path overrides working_directory
+        assert cmd[idx + 1] == "/tmp/worktree"
+
+    def test_worktree_without_path_uses_workdir(self) -> None:
+        agent = CodexAgent()
+        cfg = AgentConfig(
+            working_directory="/project",
+            use_worktree=True,
+        )
+        cmd = agent._build_cmd("task", cfg)
+        idx = cmd.index("-C")
+        assert cmd[idx + 1] == "/project"
+
+
+# ---------------------------------------------------------------------------
+# OllamaCodexAgent._build_cmd
+# ---------------------------------------------------------------------------
+
+class TestOllamaCodexBuildCmd:
+    def test_oss_flag_present(self) -> None:
+        agent = OllamaCodexAgent()
+        cmd = agent._build_cmd("do stuff", AgentConfig())
+        assert "--oss" in cmd
+        assert cmd == ["codex", "exec", "--oss", "do stuff", "--json"]
+
+    def test_model(self) -> None:
+        agent = OllamaCodexAgent(model="qwen2.5:3b")
+        cmd = agent._build_cmd("task", AgentConfig())
+        assert "-m" in cmd
+        idx = cmd.index("-m")
+        assert cmd[idx + 1] == "qwen2.5:3b"
+
+    def test_working_directory(self) -> None:
+        agent = OllamaCodexAgent()
+        cfg = AgentConfig(working_directory="/project")
+        cmd = agent._build_cmd("task", cfg)
+        assert "-C" in cmd
+        idx = cmd.index("-C")
+        assert cmd[idx + 1] == "/project"
+
+
+# ---------------------------------------------------------------------------
+# ClaudeCodeAgent.run (mocked subprocess)
+# ---------------------------------------------------------------------------
+
+class TestClaudeCodeRun:
+    @patch("llm_provider.agent.subprocess.run")
+    def test_success(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='{"result": "Task done", "model": "claude-sonnet-4-6"}\n',
+            stderr="",
+        )
+        agent = ClaudeCodeAgent()
+        result = agent.run("fix bug")
+        assert result.exit_code == 0
+        assert result.output == "Task done"
+        assert result.backend == "claude-code"
+        assert result.error is None
+        assert len(result.raw_events) == 1
+
+    @patch("llm_provider.agent.subprocess.run")
+    def test_failure(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1,
+            stdout="", stderr="Error: something broke",
+        )
+        agent = ClaudeCodeAgent()
+        result = agent.run("bad task")
+        assert result.exit_code == 1
+        assert result.error == "Error: something broke"
+
+    @patch("llm_provider.agent.subprocess.run")
+    def test_timeout(self, mock_run: MagicMock) -> None:
+        exc = subprocess.TimeoutExpired(cmd=["claude"], timeout=30)
+        exc.stdout = "partial output"
+        mock_run.side_effect = exc
+        agent = ClaudeCodeAgent()
+        cfg = AgentConfig(timeout=30)
+        result = agent.run("slow task", config=cfg)
+        assert result.exit_code == -1
+        assert "Timed out" in (result.error or "")
+        assert result.output == "partial output"
+
+    @patch("llm_provider.agent.subprocess.run")
+    def test_working_directory_in_result(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr="",
+        )
+        agent = ClaudeCodeAgent()
+        cfg = AgentConfig(working_directory="/my/project")
+        result = agent.run("task", config=cfg)
+        assert result.working_directory == "/my/project"
+
+    @patch("llm_provider.agent.subprocess.run")
+    def test_model_from_constructor(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr="",
+        )
+        agent = ClaudeCodeAgent(model="opus")
+        result = agent.run("task")
+        assert result.model == "opus"
+
+    @patch("llm_provider.agent.subprocess.run")
+    def test_model_extracted_from_events(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout='{"model": "claude-haiku-4-5-20251001", "result": "ok"}\n',
+            stderr="",
+        )
+        agent = ClaudeCodeAgent()
+        result = agent.run("task")
+        assert result.model == "claude-haiku-4-5-20251001"
+
+    @patch("llm_provider.agent.subprocess.run")
+    def test_non_json_stdout(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="plain text output\n",
+            stderr="",
+        )
+        agent = ClaudeCodeAgent()
+        result = agent.run("task")
+        assert result.output == "plain text output\n"
+        assert result.raw_events == []
+
+    @patch("llm_provider.agent.subprocess.run")
+    def test_default_config_used(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr="",
+        )
+        default_cfg = AgentConfig(working_directory="/default")
+        agent = ClaudeCodeAgent(default_config=default_cfg)
+        agent.run("task")
+        # Verify --cd /default was in the command
+        call_args = mock_run.call_args[0][0]
+        idx = call_args.index("--cd")
+        assert call_args[idx + 1] == "/default"
+
+    @patch("llm_provider.agent.subprocess.run")
+    def test_per_call_config_overrides_default(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr="",
+        )
+        default_cfg = AgentConfig(working_directory="/default")
+        agent = ClaudeCodeAgent(default_config=default_cfg)
+        override_cfg = AgentConfig(working_directory="/override")
+        agent.run("task", config=override_cfg)
+        call_args = mock_run.call_args[0][0]
+        idx = call_args.index("--cd")
+        assert call_args[idx + 1] == "/override"
+
+    @patch("llm_provider.agent.subprocess.run")
+    def test_env_passed_to_subprocess(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr="",
+        )
+        agent = ClaudeCodeAgent()
+        cfg = AgentConfig(env={"CUSTOM_VAR": "value"})
+        agent.run("task", config=cfg)
+        env_arg = mock_run.call_args[1].get("env")
+        assert env_arg is not None
+        assert env_arg["CUSTOM_VAR"] == "value"
+
+
+# ---------------------------------------------------------------------------
+# ClaudeCodeAgent.stream (mocked subprocess)
+# ---------------------------------------------------------------------------
+
+class TestClaudeCodeStream:
+    @patch("llm_provider.agent.subprocess.Popen")
+    def test_yields_lines(self, mock_popen: MagicMock) -> None:
+        lines = ['{"type": "start"}\n', '{"result": "done"}\n']
+        mock_proc = MagicMock()
+        mock_proc.stdout = iter(lines)
+        mock_proc.stderr = MagicMock()
+        mock_proc.stderr.read.return_value = ""
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        agent = ClaudeCodeAgent()
+        collected = list(agent.stream("task"))
+        assert len(collected) == 2
+        assert collected[0] == '{"type": "start"}'
+        assert collected[1] == '{"result": "done"}'
+
+    @patch("llm_provider.agent.subprocess.Popen")
+    def test_last_result_populated(self, mock_popen: MagicMock) -> None:
+        lines = ['{"result": "all good", "model": "sonnet"}\n']
+        mock_proc = MagicMock()
+        mock_proc.stdout = iter(lines)
+        mock_proc.stderr = MagicMock()
+        mock_proc.stderr.read.return_value = ""
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        agent = ClaudeCodeAgent()
+        # Must exhaust the iterator
+        for _ in agent.stream("task"):
+            pass
+        result = agent.last_result
+        assert result is not None
+        assert result.exit_code == 0
+        assert result.output == "all good"
+        assert result.backend == "claude-code"
+
+    @patch("llm_provider.agent.subprocess.Popen")
+    def test_callback_invoked(self, mock_popen: MagicMock) -> None:
+        lines = ["line one\n", "line two\n"]
+        mock_proc = MagicMock()
+        mock_proc.stdout = iter(lines)
+        mock_proc.stderr = MagicMock()
+        mock_proc.stderr.read.return_value = ""
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        collected: list[str] = []
+        agent = ClaudeCodeAgent()
+        agent.set_callback(lambda line: collected.append(line))
+        for _ in agent.stream("task"):
+            pass
+        assert collected == ["line one", "line two"]
+
+
+# ---------------------------------------------------------------------------
+# CodexAgent.run (mocked subprocess)
+# ---------------------------------------------------------------------------
+
+class TestCodexRun:
+    @patch("llm_provider.agent.subprocess.run")
+    def test_success(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout='{"result": "Done by codex"}\n',
+            stderr="",
+        )
+        agent = CodexAgent()
+        result = agent.run("fix bug")
+        assert result.exit_code == 0
+        assert result.output == "Done by codex"
+        assert result.backend == "codex"
+
+    @patch("llm_provider.agent.subprocess.run")
+    def test_timeout(self, mock_run: MagicMock) -> None:
+        exc = subprocess.TimeoutExpired(cmd=["codex"], timeout=60)
+        exc.stdout = ""
+        mock_run.side_effect = exc
+        agent = CodexAgent()
+        cfg = AgentConfig(timeout=60)
+        result = agent.run("task", config=cfg)
+        assert result.exit_code == -1
+        assert result.backend == "codex"
+
+
+# ---------------------------------------------------------------------------
+# OllamaCodexAgent.run (mocked subprocess)
+# ---------------------------------------------------------------------------
+
+class TestOllamaCodexRun:
+    @patch("llm_provider.agent.subprocess.run")
+    def test_success(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout='{"result": "Local model done"}\n',
+            stderr="",
+        )
+        agent = OllamaCodexAgent()
+        result = agent.run("analyze code")
+        assert result.exit_code == 0
+        assert result.output == "Local model done"
+        assert result.backend == "codex-oss"
+
+    @patch("llm_provider.agent.subprocess.run")
+    def test_oss_in_command(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr="",
+        )
+        agent = OllamaCodexAgent()
+        agent.run("task")
+        call_args = mock_run.call_args[0][0]
+        assert "--oss" in call_args
+
+
+# ---------------------------------------------------------------------------
+# is_available
+# ---------------------------------------------------------------------------
+
+class TestIsAvailable:
+    @patch("shutil.which", return_value="/usr/bin/claude")
+    def test_claude_available(self, _mock: MagicMock) -> None:
+        assert ClaudeCodeAgent().is_available() is True
+
+    @patch("shutil.which", return_value=None)
+    def test_claude_not_available(self, _mock: MagicMock) -> None:
+        assert ClaudeCodeAgent().is_available() is False
+
+    @patch("shutil.which", return_value="/usr/bin/codex")
+    def test_codex_available(self, _mock: MagicMock) -> None:
+        assert CodexAgent().is_available() is True
+
+    @patch("shutil.which", return_value="/usr/bin/codex")
+    def test_ollama_codex_available(self, _mock: MagicMock) -> None:
+        assert OllamaCodexAgent().is_available() is True
+
+
+# ---------------------------------------------------------------------------
+# executable
+# ---------------------------------------------------------------------------
+
+class TestExecutable:
+    def test_claude(self) -> None:
+        assert ClaudeCodeAgent().executable() == "claude"
+
+    def test_codex(self) -> None:
+        assert CodexAgent().executable() == "codex"
+
+    def test_ollama_codex(self) -> None:
+        assert OllamaCodexAgent().executable() == "codex"
+
+
+# ---------------------------------------------------------------------------
+# Context manager
+# ---------------------------------------------------------------------------
+
+class TestContextManager:
+    def test_claude_code_context_manager(self) -> None:
+        with ClaudeCodeAgent() as agent:
+            assert isinstance(agent, AgentBackend)
+
+    def test_codex_context_manager(self) -> None:
+        with CodexAgent() as agent:
+            assert isinstance(agent, AgentBackend)
+
+
+# ---------------------------------------------------------------------------
+# get_agent factory
+# ---------------------------------------------------------------------------
+
+class TestGetAgent:
+    def test_claude_code(self) -> None:
+        agent = get_agent("claude-code")
+        assert isinstance(agent, ClaudeCodeAgent)
+
+    def test_codex(self) -> None:
+        agent = get_agent("codex")
+        assert isinstance(agent, CodexAgent)
+
+    def test_ollama(self) -> None:
+        agent = get_agent("ollama")
+        assert isinstance(agent, OllamaCodexAgent)
+
+    def test_codex_oss_alias(self) -> None:
+        agent = get_agent("codex-oss")
+        assert isinstance(agent, OllamaCodexAgent)
+
+    def test_unknown_raises(self) -> None:
+        with pytest.raises(ValueError, match="Unknown agent backend"):
+            get_agent("invalid-backend")
+
+    @patch.dict(os.environ, {"AGENT_BACKEND": "codex"})
+    def test_env_var_fallback(self) -> None:
+        agent = get_agent()
+        assert isinstance(agent, CodexAgent)
+
+    @patch.dict(os.environ, {"AGENT_BACKEND": "ollama"})
+    def test_env_var_ollama(self) -> None:
+        agent = get_agent()
+        assert isinstance(agent, OllamaCodexAgent)
+
+    def test_default_is_claude_code(self) -> None:
+        # Clear AGENT_BACKEND if set
+        env = os.environ.copy()
+        env.pop("AGENT_BACKEND", None)
+        with patch.dict(os.environ, env, clear=True):
+            agent = get_agent()
+            assert isinstance(agent, ClaudeCodeAgent)
+
+    def test_model_passed_to_agent(self) -> None:
+        agent = get_agent("claude-code", model="opus")
+        assert isinstance(agent, ClaudeCodeAgent)
+        assert agent._model == "opus"
+
+    def test_config_passed_to_agent(self) -> None:
+        cfg = AgentConfig(working_directory="/work")
+        agent = get_agent("codex", config=cfg)
+        assert isinstance(agent, CodexAgent)
+        assert agent._default_config.working_directory == "/work"
+
+    def test_callback_registered(self) -> None:
+        lines: list[str] = []
+        agent = get_agent("claude-code", callback=lambda l: lines.append(l))
+        assert agent._callback is not None
+
+
+# ---------------------------------------------------------------------------
+# Model from environment variable
+# ---------------------------------------------------------------------------
+
+class TestModelEnvVar:
+    @patch.dict(os.environ, {"CLAUDE_MODEL": "claude-opus-4-6"})
+    def test_claude_model_from_env(self) -> None:
+        agent = ClaudeCodeAgent()
+        assert agent._model == "claude-opus-4-6"
+
+    @patch.dict(os.environ, {"CODEX_MODEL": "o3"})
+    def test_codex_model_from_env(self) -> None:
+        agent = CodexAgent()
+        assert agent._model == "o3"
+
+    @patch.dict(os.environ, {"OLLAMA_MODEL": "qwen2.5:3b"})
+    def test_ollama_model_from_env(self) -> None:
+        agent = OllamaCodexAgent()
+        assert agent._model == "qwen2.5:3b"
+
+    def test_constructor_overrides_env(self) -> None:
+        with patch.dict(os.environ, {"CLAUDE_MODEL": "from-env"}):
+            agent = ClaudeCodeAgent(model="from-arg")
+            assert agent._model == "from-arg"
+
+
+# ---------------------------------------------------------------------------
+# Backend name
+# ---------------------------------------------------------------------------
+
+class TestBackendName:
+    def test_codex_backend_name(self) -> None:
+        assert CodexAgent()._backend_name == "codex"
+
+    def test_ollama_backend_name(self) -> None:
+        assert OllamaCodexAgent()._backend_name == "codex-oss"
