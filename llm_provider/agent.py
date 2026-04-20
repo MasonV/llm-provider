@@ -51,7 +51,7 @@ class AgentConfig:
     """Shared configuration for all agent backends.
 
     Fields map to CLI flags common across backends.  Backend-specific
-    translation happens inside each implementation's ``_build_cmd``.
+    translation happens inside each implementation's ``build_cmd``.
     """
 
     working_directory: str = ""
@@ -64,6 +64,8 @@ class AgentConfig:
     use_worktree: bool = False
     worktree_path: str = ""
     env: dict[str, str] = field(default_factory=dict)
+    mcp_config_path: str = ""
+    allowed_tools: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -216,11 +218,33 @@ class ClaudeCodeAgent(AgentBackend):
         """Return *config* if given, otherwise the constructor default."""
         return config if config is not None else self._default_config
 
-    def _build_cmd(self, prompt: str, config: AgentConfig) -> list[str]:
-        """Assemble the ``claude`` CLI argument list."""
-        cmd = ["claude", "-p", prompt, "--output-format", "json"]
-        if config.working_directory:
-            cmd += ["--cd", config.working_directory]
+    def build_cmd(
+        self,
+        prompt: str | None,
+        config: AgentConfig,
+        *,
+        output_format: str | None = None,
+    ) -> list[str]:
+        """Assemble the ``claude`` CLI argument list.
+
+        Args:
+            prompt: Prompt text passed as ``-p PROMPT``.  Pass ``None`` to emit
+                only the ``-p`` flag and supply the prompt on stdin instead —
+                required for long prompts that exceed shell argument limits.
+            config: Run configuration.
+            output_format: Value for ``--output-format``.  Use ``"json"`` for
+                blocking ``run()`` calls and ``"stream-json"`` for streaming.
+                ``None`` omits the flag entirely (e.g. when piping to a terminal).
+        """
+        cmd = ["claude"]
+        if config.mcp_config_path:
+            cmd += ["--mcp-config", config.mcp_config_path]
+        if prompt is not None:
+            cmd += ["-p", prompt]
+        else:
+            cmd.append("-p")
+        if output_format is not None:
+            cmd += ["--output-format", output_format]
         model = self._model or config.model
         if model:
             cmd += ["--model", model]
@@ -232,23 +256,26 @@ class ClaudeCodeAgent(AgentBackend):
             cmd += ["--permission-mode", config.permission_mode]
         if config.settings_path:
             cmd += ["--settings", config.settings_path]
+        for tool in config.allowed_tools:
+            cmd += ["--allowedTools", tool]
         if config.use_worktree:
             cmd.append("--worktree")
         return cmd
 
     def run(self, prompt: str, *, config: AgentConfig | None = None) -> AgentResult:
         cfg = self._resolve_config(config)
-        cmd = self._build_cmd(prompt, cfg)
+        cmd = self.build_cmd(prompt, cfg, output_format="json")
         _log.info("ClaudeCode run: cmd=%s", cmd[:4])
 
         t0 = time.monotonic()
         timeout = cfg.timeout if cfg.timeout > 0 else None
         env = {**os.environ, **cfg.env} if cfg.env else None
+        cwd = cfg.working_directory or None
 
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True,
-                timeout=timeout, env=env,
+                timeout=timeout, env=env, cwd=cwd,
             )
         except subprocess.TimeoutExpired as exc:
             duration = time.monotonic() - t0
@@ -286,15 +313,16 @@ class ClaudeCodeAgent(AgentBackend):
         self, prompt: str, *, config: AgentConfig | None = None
     ) -> Iterator[str]:
         cfg = self._resolve_config(config)
-        cmd = self._build_cmd(prompt, cfg)
+        cmd = self.build_cmd(prompt, cfg, output_format="stream-json")
         _log.info("ClaudeCode stream: cmd=%s", cmd[:4])
 
         t0 = time.monotonic()
         env = {**os.environ, **cfg.env} if cfg.env else None
+        cwd = cfg.working_directory or None
 
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, env=env,
+            text=True, env=env, cwd=cwd,
         )
         events: list[dict[str, Any]] = []
         try:

@@ -80,6 +80,8 @@ class TestAgentConfig:
         assert c.use_worktree is False
         assert c.worktree_path == ""
         assert c.env == {}
+        assert c.mcp_config_path == ""
+        assert c.allowed_tools == []
 
     def test_custom_values(self) -> None:
         c = AgentConfig(
@@ -179,26 +181,37 @@ class TestExtractModel:
 
 
 # ---------------------------------------------------------------------------
-# ClaudeCodeAgent._build_cmd
+# ClaudeCodeAgent.build_cmd
 # ---------------------------------------------------------------------------
 
 class TestClaudeCodeBuildCmd:
-    def test_minimal(self) -> None:
+    def test_minimal_with_prompt(self) -> None:
         agent = ClaudeCodeAgent()
-        cmd = agent._build_cmd("do stuff", AgentConfig())
+        cmd = agent.build_cmd("do stuff", AgentConfig())
+        assert cmd == ["claude", "-p", "do stuff"]
+
+    def test_minimal_with_output_format(self) -> None:
+        agent = ClaudeCodeAgent()
+        cmd = agent.build_cmd("do stuff", AgentConfig(), output_format="json")
         assert cmd == ["claude", "-p", "do stuff", "--output-format", "json"]
 
-    def test_working_directory(self) -> None:
+    def test_stdin_mode_prompt_none(self) -> None:
+        # prompt=None emits bare -p flag; caller writes prompt to stdin
+        agent = ClaudeCodeAgent()
+        cmd = agent.build_cmd(None, AgentConfig())
+        assert cmd == ["claude", "-p"]
+        assert "--cd" not in cmd
+
+    def test_working_directory_not_in_cmd(self) -> None:
+        # working_directory goes to cwd= kwarg on subprocess, never --cd
         agent = ClaudeCodeAgent()
         cfg = AgentConfig(working_directory="/tmp/work")
-        cmd = agent._build_cmd("task", cfg)
-        assert "--cd" in cmd
-        idx = cmd.index("--cd")
-        assert cmd[idx + 1] == "/tmp/work"
+        cmd = agent.build_cmd("task", cfg)
+        assert "--cd" not in cmd
 
     def test_model_from_constructor(self) -> None:
         agent = ClaudeCodeAgent(model="claude-opus-4-6")
-        cmd = agent._build_cmd("task", AgentConfig())
+        cmd = agent.build_cmd("task", AgentConfig())
         assert "--model" in cmd
         idx = cmd.index("--model")
         assert cmd[idx + 1] == "claude-opus-4-6"
@@ -206,7 +219,7 @@ class TestClaudeCodeBuildCmd:
     def test_model_from_config(self) -> None:
         agent = ClaudeCodeAgent()
         cfg = AgentConfig(model="claude-sonnet-4-6")
-        cmd = agent._build_cmd("task", cfg)
+        cmd = agent.build_cmd("task", cfg)
         assert "--model" in cmd
         idx = cmd.index("--model")
         assert cmd[idx + 1] == "claude-sonnet-4-6"
@@ -214,27 +227,27 @@ class TestClaudeCodeBuildCmd:
     def test_constructor_model_overrides_config(self) -> None:
         agent = ClaudeCodeAgent(model="opus")
         cfg = AgentConfig(model="sonnet")
-        cmd = agent._build_cmd("task", cfg)
+        cmd = agent.build_cmd("task", cfg)
         idx = cmd.index("--model")
         assert cmd[idx + 1] == "opus"
 
     def test_max_turns(self) -> None:
         agent = ClaudeCodeAgent()
         cfg = AgentConfig(max_turns=10)
-        cmd = agent._build_cmd("task", cfg)
+        cmd = agent.build_cmd("task", cfg)
         assert "--max-turns" in cmd
         idx = cmd.index("--max-turns")
         assert cmd[idx + 1] == "10"
 
     def test_max_turns_zero_omitted(self) -> None:
         agent = ClaudeCodeAgent()
-        cmd = agent._build_cmd("task", AgentConfig())
+        cmd = agent.build_cmd("task", AgentConfig())
         assert "--max-turns" not in cmd
 
     def test_sandbox(self) -> None:
         agent = ClaudeCodeAgent()
         cfg = AgentConfig(sandbox="workspace-write")
-        cmd = agent._build_cmd("task", cfg)
+        cmd = agent.build_cmd("task", cfg)
         assert "--sandbox" in cmd
         idx = cmd.index("--sandbox")
         assert cmd[idx + 1] == "workspace-write"
@@ -242,7 +255,7 @@ class TestClaudeCodeBuildCmd:
     def test_permission_mode(self) -> None:
         agent = ClaudeCodeAgent()
         cfg = AgentConfig(permission_mode="dontAsk")
-        cmd = agent._build_cmd("task", cfg)
+        cmd = agent.build_cmd("task", cfg)
         assert "--permission-mode" in cmd
         idx = cmd.index("--permission-mode")
         assert cmd[idx + 1] == "dontAsk"
@@ -250,7 +263,7 @@ class TestClaudeCodeBuildCmd:
     def test_settings_path(self) -> None:
         agent = ClaudeCodeAgent()
         cfg = AgentConfig(settings_path="/path/to/settings.json")
-        cmd = agent._build_cmd("task", cfg)
+        cmd = agent.build_cmd("task", cfg)
         assert "--settings" in cmd
         idx = cmd.index("--settings")
         assert cmd[idx + 1] == "/path/to/settings.json"
@@ -258,35 +271,92 @@ class TestClaudeCodeBuildCmd:
     def test_worktree(self) -> None:
         agent = ClaudeCodeAgent()
         cfg = AgentConfig(use_worktree=True)
-        cmd = agent._build_cmd("task", cfg)
+        cmd = agent.build_cmd("task", cfg)
         assert "--worktree" in cmd
 
     def test_worktree_false_omitted(self) -> None:
         agent = ClaudeCodeAgent()
-        cmd = agent._build_cmd("task", AgentConfig())
+        cmd = agent.build_cmd("task", AgentConfig())
         assert "--worktree" not in cmd
+
+    def test_mcp_config_path(self) -> None:
+        agent = ClaudeCodeAgent()
+        cfg = AgentConfig(mcp_config_path="/tmp/mcp.json")
+        cmd = agent.build_cmd("task", cfg)
+        assert "--mcp-config" in cmd
+        idx = cmd.index("--mcp-config")
+        assert cmd[idx + 1] == "/tmp/mcp.json"
+        # mcp-config must come before -p
+        assert cmd.index("--mcp-config") < cmd.index("-p")
+
+    def test_mcp_config_omitted_when_empty(self) -> None:
+        agent = ClaudeCodeAgent()
+        cmd = agent.build_cmd("task", AgentConfig())
+        assert "--mcp-config" not in cmd
+
+    def test_allowed_tools_single(self) -> None:
+        agent = ClaudeCodeAgent()
+        cfg = AgentConfig(allowed_tools=["mcp__autodev__*"])
+        cmd = agent.build_cmd("task", cfg)
+        assert "--allowedTools" in cmd
+        idx = cmd.index("--allowedTools")
+        assert cmd[idx + 1] == "mcp__autodev__*"
+
+    def test_allowed_tools_multiple(self) -> None:
+        agent = ClaudeCodeAgent()
+        cfg = AgentConfig(allowed_tools=["Read", "Write", "Bash(*)"])
+        cmd = agent.build_cmd("task", cfg)
+        # Each tool gets its own --allowedTools flag
+        tool_pairs = [
+            (cmd[i + 1], True)
+            for i, tok in enumerate(cmd)
+            if tok == "--allowedTools"
+        ]
+        tools = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--allowedTools"]
+        assert tools == ["Read", "Write", "Bash(*)"]
+
+    def test_allowed_tools_omitted_when_empty(self) -> None:
+        agent = ClaudeCodeAgent()
+        cmd = agent.build_cmd("task", AgentConfig())
+        assert "--allowedTools" not in cmd
+
+    def test_output_format_none_omitted(self) -> None:
+        agent = ClaudeCodeAgent()
+        cmd = agent.build_cmd("task", AgentConfig(), output_format=None)
+        assert "--output-format" not in cmd
+
+    def test_output_format_stream_json(self) -> None:
+        agent = ClaudeCodeAgent()
+        cmd = agent.build_cmd("task", AgentConfig(), output_format="stream-json")
+        assert "--output-format" in cmd
+        idx = cmd.index("--output-format")
+        assert cmd[idx + 1] == "stream-json"
 
     def test_full_config(self) -> None:
         agent = ClaudeCodeAgent(model="claude-sonnet-4-6")
         cfg = AgentConfig(
             working_directory="/project",
+            mcp_config_path="/tmp/mcp.json",
             max_turns=5,
             sandbox="workspace-write",
             permission_mode="dontAsk",
             settings_path="/s.json",
+            allowed_tools=["mcp__autodev__*", "Read"],
             use_worktree=True,
         )
-        cmd = agent._build_cmd("build feature", cfg)
+        cmd = agent.build_cmd("build feature", cfg, output_format="stream-json")
         assert cmd[0] == "claude"
+        assert "--mcp-config" in cmd
         assert "-p" in cmd
         assert "build feature" in cmd
         assert "--output-format" in cmd
-        assert "--cd" in cmd
+        assert "--cd" not in cmd
         assert "--model" in cmd
         assert "--max-turns" in cmd
         assert "--sandbox" in cmd
         assert "--permission-mode" in cmd
         assert "--settings" in cmd
+        assert "--allowedTools" in cmd
         assert "--worktree" in cmd
 
 
@@ -481,10 +551,10 @@ class TestClaudeCodeRun:
         default_cfg = AgentConfig(working_directory="/default")
         agent = ClaudeCodeAgent(default_config=default_cfg)
         agent.run("task")
-        # Verify --cd /default was in the command
+        # working_directory goes to cwd= kwarg, not --cd flag
         call_args = mock_run.call_args[0][0]
-        idx = call_args.index("--cd")
-        assert call_args[idx + 1] == "/default"
+        assert "--cd" not in call_args
+        assert mock_run.call_args[1].get("cwd") == "/default"
 
     @patch("llm_provider.agent.subprocess.run")
     def test_per_call_config_overrides_default(self, mock_run: MagicMock) -> None:
@@ -496,8 +566,8 @@ class TestClaudeCodeRun:
         override_cfg = AgentConfig(working_directory="/override")
         agent.run("task", config=override_cfg)
         call_args = mock_run.call_args[0][0]
-        idx = call_args.index("--cd")
-        assert call_args[idx + 1] == "/override"
+        assert "--cd" not in call_args
+        assert mock_run.call_args[1].get("cwd") == "/override"
 
     @patch("llm_provider.agent.subprocess.run")
     def test_env_passed_to_subprocess(self, mock_run: MagicMock) -> None:
