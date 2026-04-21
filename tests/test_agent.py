@@ -1082,3 +1082,62 @@ class TestBackendName:
 
     def test_ollama_backend_name(self) -> None:
         assert OllamaCodexAgent()._backend_name == "codex-oss"
+
+
+# ---------------------------------------------------------------------------
+# list_agent_models
+# ---------------------------------------------------------------------------
+
+from llm_provider.agent import CLAUDE_CODE_MODELS, CODEX_MODELS, list_agent_models
+
+
+class TestListAgentModels:
+    def test_claude_code_returns_list(self) -> None:
+        models = list_agent_models("claude-code")
+        assert isinstance(models, list)
+        assert "claude-sonnet-4-6" in models
+        assert "claude-opus-4-7" in models
+
+    def test_claude_code_returns_copy(self) -> None:
+        models = list_agent_models("claude-code")
+        models.clear()
+        assert len(CLAUDE_CODE_MODELS) > 0
+
+    def test_codex_returns_list(self) -> None:
+        models = list_agent_models("codex")
+        assert isinstance(models, list)
+        assert "gpt-5.4" in models
+        assert "gpt-5.3-codex" in models
+
+    def test_codex_returns_copy(self) -> None:
+        models = list_agent_models("codex")
+        models.clear()
+        assert len(CODEX_MODELS) > 0
+
+    def test_ollama_returns_names_on_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        fake_response = MagicMock()
+        fake_response.json.return_value = {
+            "models": [{"name": "qwen2.5:3b"}, {"name": "llama3:8b"}]
+        }
+        monkeypatch.setattr(httpx, "get", lambda *a, **kw: fake_response)
+        assert list_agent_models("ollama") == ["qwen2.5:3b", "llama3:8b"]
+
+    def test_codex_oss_alias(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        fake_response = MagicMock()
+        fake_response.json.return_value = {"models": [{"name": "phi4"}]}
+        monkeypatch.setattr(httpx, "get", lambda *a, **kw: fake_response)
+        assert list_agent_models("codex-oss") == ["phi4"]
+
+    def test_ollama_returns_empty_on_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        monkeypatch.setattr(httpx, "get", lambda *a, **kw: (_ for _ in ()).throw(httpx.ConnectError("x")))
+        assert list_agent_models("ollama") == []
+
+    def test_unknown_backend_raises(self) -> None:
+        with pytest.raises(ValueError, match="Unknown backend"):
+            list_agent_models("nope")

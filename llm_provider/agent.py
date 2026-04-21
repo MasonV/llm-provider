@@ -660,6 +660,58 @@ class OllamaCodexAgent(_BaseCodexAgent):
 # Factory
 # ---------------------------------------------------------------------------
 
+CLAUDE_CODE_MODELS: list[str] = [
+    "claude-haiku-4-5-20251001",
+    "claude-sonnet-4-6",
+    "claude-opus-4-7",
+]
+
+CODEX_MODELS: list[str] = [
+    "gpt-5.2",
+    "gpt-5.3-codex",
+    "gpt-5.4-mini",
+    "gpt-5.4",
+]
+
+
+def list_agent_models(backend: str, *, ollama_base_url: str = "") -> list[str]:
+    """Return known model IDs for an agent backend.
+
+    For ``"claude-code"`` and ``"codex"``, returns a static list.  For
+    ``"ollama"``/``"codex-oss"``, queries the local Ollama server and returns
+    installed model names; returns an empty list if unreachable.
+
+    Args:
+        backend: One of ``"claude-code"``, ``"codex"``, ``"ollama"``, or
+            ``"codex-oss"``.
+        ollama_base_url: Ollama server URL override.  Defaults to the
+            ``OLLAMA_BASE_URL`` env var or ``http://localhost:11434``.
+    """
+    if backend == "claude-code":
+        return list(CLAUDE_CODE_MODELS)
+    if backend == "codex":
+        return list(CODEX_MODELS)
+    if backend in ("ollama", "codex-oss"):
+        base_url = ollama_base_url or os.environ.get(
+            "OLLAMA_BASE_URL", "http://localhost:11434"
+        )
+        import httpx
+        try:
+            response = httpx.get(f"{base_url}/api/tags", timeout=5.0)
+            response.raise_for_status()
+            data = response.json()
+            return [m["name"] for m in data.get("models", [])]
+        except Exception as exc:
+            _log.warning(
+                "list_agent_models: Ollama query failed (%s): %s", base_url, exc
+            )
+            return []
+    raise ValueError(
+        f"Unknown backend: {backend!r}. "
+        "Expected 'claude-code', 'codex', or 'ollama'."
+    )
+
+
 def get_agent(
     backend: str | None = None,
     *,

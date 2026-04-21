@@ -2,14 +2,17 @@ from .events import CompletionCallback, CompletionEvent
 
 from .provider import (
     AIProvider,
+    CLAUDE_MODELS,
     ClaudeProvider,
     CompletionResult,
     CompletionStream,
     CompletionUsage,
     OllamaProvider,
+    OPENAI_MODELS,
     OpenAIProvider,
     Prompt,
     get_provider,
+    list_models,
 )
 
 from .async_provider import (
@@ -26,10 +29,13 @@ from .agent import (
     AgentCallback,
     AgentConfig,
     AgentResult,
+    CLAUDE_CODE_MODELS,
     ClaudeCodeAgent,
+    CODEX_MODELS,
     CodexAgent,
     OllamaCodexAgent,
     get_agent,
+    list_agent_models,
 )
 
 __all__ = [
@@ -43,8 +49,11 @@ __all__ = [
     "AsyncCompletionStream",
     "AsyncOllamaProvider",
     "AsyncOpenAIProvider",
+    "CLAUDE_CODE_MODELS",
+    "CLAUDE_MODELS",
     "ClaudeCodeAgent",
     "ClaudeProvider",
+    "CODEX_MODELS",
     "CodexAgent",
     "CompletionCallback",
     "CompletionEvent",
@@ -53,9 +62,12 @@ __all__ = [
     "CompletionUsage",
     "OllamaCodexAgent",
     "OllamaProvider",
+    "OPENAI_MODELS",
     "OpenAIProvider",
     "Prompt",
     "get_agent",
     "get_async_provider",
     "get_provider",
+    "list_agent_models",
+    "list_models",
 ]
