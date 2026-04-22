@@ -517,10 +517,15 @@ class _BaseCodexAgent(AgentBackend):
         model = self._model or config.model
         if model:
             cmd += ["-m", model]
-        if config.sandbox:
-            cmd += ["-s", config.sandbox]
-        if config.permission_mode:
-            cmd += ["-a", config.permission_mode]
+
+        # Without this, every MCP tool call in exec mode fails with "user
+        # cancelled MCP tool call": Codex routes MCP calls through an approval
+        # elicitation, and `codex exec` has no user to respond — so it auto-
+        # cancels. Dropping the sandbox short-circuits that path. The caller
+        # is expected to provide isolation (container, worktree, etc.).
+        sandbox = config.sandbox or "danger-full-access"
+        cmd += ["-s", sandbox]
+        cmd += ["-c", 'approval_policy="never"']
 
         if prompt is not None:
             cmd.append(prompt)
