@@ -246,6 +246,19 @@ class TestClaudeCodeBuildCmd:
         idx = cmd.index("--max-turns")
         assert cmd[idx + 1] == "10"
 
+    def test_effort(self) -> None:
+        agent = ClaudeCodeAgent()
+        cfg = AgentConfig(effort="high")
+        cmd = agent.build_cmd("task", cfg)
+        assert "--effort" in cmd
+        idx = cmd.index("--effort")
+        assert cmd[idx + 1] == "high"
+
+    def test_effort_empty_omitted(self) -> None:
+        agent = ClaudeCodeAgent()
+        cmd = agent.build_cmd("task", AgentConfig())
+        assert "--effort" not in cmd
+
     def test_max_turns_zero_omitted(self) -> None:
         agent = ClaudeCodeAgent()
         cmd = agent.build_cmd("task", AgentConfig())
@@ -569,6 +582,20 @@ class TestCodexBuildCmd:
         assert "-s" in cmd
         idx = cmd.index("-s")
         assert cmd[idx + 1] == "read-only"
+
+    def test_effort_emits_toml_override(self) -> None:
+        agent = CodexAgent()
+        cfg = AgentConfig(effort="high")
+        cmd = agent.build_cmd("task", cfg)
+        # Effort lands as a -c TOML override
+        assert 'model_reasoning_effort="high"' in cmd
+        idx = cmd.index('model_reasoning_effort="high"')
+        assert cmd[idx - 1] == "-c"
+
+    def test_effort_empty_omitted(self) -> None:
+        agent = CodexAgent()
+        cmd = agent.build_cmd("task", AgentConfig())
+        assert not any("model_reasoning_effort" in t for t in cmd)
 
     def test_permission_mode_maps_to_approval(self) -> None:
         agent = CodexAgent()
