@@ -705,6 +705,62 @@ class OpenAIProvider(AIProvider):
         return CompletionStream(_chunks(), model=self._model, finalizer=_finalizer)
 
 
+CLAUDE_MODELS: list[str] = [
+    "claude-haiku-4-5-20251001",
+    "claude-sonnet-4-6",
+    "claude-opus-4-7",
+]
+
+OPENAI_MODELS: list[str] = [
+    "gpt-4o-mini",
+    "gpt-4o",
+    "gpt-4.1-nano",
+    "gpt-4.1-mini",
+    "gpt-4.1",
+    "o4-mini",
+    "o3",
+    "gpt-5.2",
+    "gpt-5.3-codex",
+    "gpt-5.4-mini",
+    "gpt-5.4",
+]
+
+
+def list_models(provider: str, *, ollama_base_url: str = "") -> list[str]:
+    """Return known model IDs for a provider.
+
+    For ``"claude"`` and ``"openai"``, returns a static list of supported models
+    ordered from fastest/cheapest to most capable.  For ``"ollama"``, queries the
+    local server's ``/api/tags`` endpoint and returns installed model names; returns
+    an empty list if the server is unreachable rather than raising.
+
+    Args:
+        provider: One of ``"claude"``, ``"openai"``, or ``"ollama"``.
+        ollama_base_url: Ollama server URL override.  Defaults to the
+            ``OLLAMA_BASE_URL`` env var or ``http://localhost:11434``.
+    """
+    if provider == "claude":
+        return list(CLAUDE_MODELS)
+    if provider == "openai":
+        return list(OPENAI_MODELS)
+    if provider == "ollama":
+        base_url = ollama_base_url or os.environ.get(
+            "OLLAMA_BASE_URL", "http://localhost:11434"
+        )
+        import httpx
+        try:
+            response = httpx.get(f"{base_url}/api/tags", timeout=5.0)
+            response.raise_for_status()
+            data = response.json()
+            return [m["name"] for m in data.get("models", [])]
+        except Exception as exc:
+            _log.warning("list_models: Ollama query failed (%s): %s", base_url, exc)
+            return []
+    raise ValueError(
+        f"Unknown provider: {provider!r}. Expected 'claude', 'openai', or 'ollama'."
+    )
+
+
 def get_provider(
     provider: str | None = None,
     *,

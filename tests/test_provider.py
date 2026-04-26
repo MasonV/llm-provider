@@ -688,3 +688,95 @@ class TestRetry:
         with pytest.raises(ConnectionError, match="Cannot reach Ollama"):
             p.complete("sys", "usr")
         assert mock_client.post.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# list_models
+# ---------------------------------------------------------------------------
+
+from llm_provider.provider import CLAUDE_MODELS, OPENAI_MODELS, list_models
+
+
+class TestListModels:
+    def test_claude_returns_list(self) -> None:
+        models = list_models("claude")
+        assert isinstance(models, list)
+        assert "claude-sonnet-4-6" in models
+        assert "claude-opus-4-7" in models
+        assert "claude-haiku-4-5-20251001" in models
+
+    def test_claude_returns_copy(self) -> None:
+        # mutating the return value must not affect the constant
+        models = list_models("claude")
+        models.clear()
+        assert len(CLAUDE_MODELS) > 0
+
+    def test_openai_returns_list(self) -> None:
+        models = list_models("openai")
+        assert isinstance(models, list)
+        assert "gpt-4o-mini" in models
+        assert "gpt-5.4" in models
+
+    def test_openai_returns_copy(self) -> None:
+        models = list_models("openai")
+        models.clear()
+        assert len(OPENAI_MODELS) > 0
+
+    def test_ollama_returns_names_on_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        fake_response = MagicMock()
+        fake_response.json.return_value = {
+            "models": [{"name": "qwen2.5:3b"}, {"name": "llama3:8b"}]
+        }
+        monkeypatch.setattr(httpx, "get", lambda *a, **kw: fake_response)
+        result = list_models("ollama")
+        assert result == ["qwen2.5:3b", "llama3:8b"]
+
+    def test_ollama_returns_empty_on_connection_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        def _raise(*a, **kw):
+            raise httpx.ConnectError("refused")
+
+        monkeypatch.setattr(httpx, "get", _raise)
+        result = list_models("ollama")
+        assert result == []
+
+    def test_ollama_uses_env_base_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        captured: list[str] = []
+        fake_response = MagicMock()
+        fake_response.json.return_value = {"models": []}
+
+        def _fake_get(url: str, **kw):
+            captured.append(url)
+            return fake_response
+
+        monkeypatch.setenv("OLLAMA_BASE_URL", "http://myhost:9999")
+        monkeypatch.setattr(httpx, "get", _fake_get)
+        list_models("ollama")
+        assert captured[0].startswith("http://myhost:9999")
+
+    def test_ollama_kwarg_overrides_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        captured: list[str] = []
+        fake_response = MagicMock()
+        fake_response.json.return_value = {"models": []}
+
+        def _fake_get(url: str, **kw):
+            captured.append(url)
+            return fake_response
+
+        monkeypatch.setenv("OLLAMA_BASE_URL", "http://envhost:8888")
+        monkeypatch.setattr(httpx, "get", _fake_get)
+        list_models("ollama", ollama_base_url="http://override:1234")
+        assert captured[0].startswith("http://override:1234")
+
+    def test_unknown_provider_raises(self) -> None:
+        with pytest.raises(ValueError, match="Unknown provider"):
+            list_models("nope")
