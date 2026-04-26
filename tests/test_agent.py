@@ -246,6 +246,19 @@ class TestClaudeCodeBuildCmd:
         idx = cmd.index("--max-turns")
         assert cmd[idx + 1] == "10"
 
+    def test_effort(self) -> None:
+        agent = ClaudeCodeAgent()
+        cfg = AgentConfig(effort="high")
+        cmd = agent.build_cmd("task", cfg)
+        assert "--effort" in cmd
+        idx = cmd.index("--effort")
+        assert cmd[idx + 1] == "high"
+
+    def test_effort_empty_omitted(self) -> None:
+        agent = ClaudeCodeAgent()
+        cmd = agent.build_cmd("task", AgentConfig())
+        assert "--effort" not in cmd
+
     def test_max_turns_zero_omitted(self) -> None:
         agent = ClaudeCodeAgent()
         cmd = agent.build_cmd("task", AgentConfig())
@@ -534,13 +547,26 @@ class TestCodexBuildCmd:
     def test_minimal(self) -> None:
         agent = CodexAgent()
         cmd = agent.build_cmd("do stuff", AgentConfig())
-        assert cmd == ["codex", "exec", "do stuff", "--json"]
+        # `codex exec` always emits sandbox + approval overrides — see
+        # _BaseCodexAgent.build_cmd for the rationale (MCP elicitation
+        # auto-cancels otherwise).
+        assert cmd == [
+            "codex", "exec",
+            "-s", "danger-full-access",
+            "-c", 'approval_policy="never"',
+            "do stuff", "--json",
+        ]
 
     def test_stdin_mode_prompt_none(self) -> None:
         # prompt=None omits positional arg; codex reads from stdin
         agent = CodexAgent()
         cmd = agent.build_cmd(None, AgentConfig())
-        assert cmd == ["codex", "exec", "--json"]
+        assert cmd == [
+            "codex", "exec",
+            "-s", "danger-full-access",
+            "-c", 'approval_policy="never"',
+            "--json",
+        ]
 
     def test_no_oss_flag(self) -> None:
         agent = CodexAgent()
@@ -570,13 +596,27 @@ class TestCodexBuildCmd:
         idx = cmd.index("-s")
         assert cmd[idx + 1] == "read-only"
 
-    def test_permission_mode_maps_to_approval(self) -> None:
+    def test_effort_emits_toml_override(self) -> None:
+        agent = CodexAgent()
+        cfg = AgentConfig(effort="high")
+        cmd = agent.build_cmd("task", cfg)
+        # Effort lands as a -c TOML override
+        assert 'model_reasoning_effort="high"' in cmd
+        idx = cmd.index('model_reasoning_effort="high"')
+        assert cmd[idx - 1] == "-c"
+
+    def test_effort_empty_omitted(self) -> None:
+        agent = CodexAgent()
+        cmd = agent.build_cmd("task", AgentConfig())
+        assert not any("model_reasoning_effort" in t for t in cmd)
+
+    def test_permission_mode_not_emitted(self) -> None:
+        # `codex exec` has no -a flag — was a copy-paste from the Claude
+        # wrapper. permission_mode is intentionally ignored for codex.
         agent = CodexAgent()
         cfg = AgentConfig(permission_mode="never")
         cmd = agent.build_cmd("task", cfg)
-        assert "-a" in cmd
-        idx = cmd.index("-a")
-        assert cmd[idx + 1] == "never"
+        assert "-a" not in cmd
 
     def test_worktree_uses_worktree_path(self) -> None:
         agent = CodexAgent()
@@ -669,7 +709,12 @@ class TestOllamaCodexBuildCmd:
         agent = OllamaCodexAgent()
         cmd = agent.build_cmd("do stuff", AgentConfig())
         assert "--oss" in cmd
-        assert cmd == ["codex", "exec", "--oss", "do stuff", "--json"]
+        assert cmd == [
+            "codex", "exec", "--oss",
+            "-s", "danger-full-access",
+            "-c", 'approval_policy="never"',
+            "do stuff", "--json",
+        ]
 
     def test_model(self) -> None:
         agent = OllamaCodexAgent(model="qwen2.5:3b")
@@ -689,7 +734,12 @@ class TestOllamaCodexBuildCmd:
     def test_stdin_mode_prompt_none(self) -> None:
         agent = OllamaCodexAgent()
         cmd = agent.build_cmd(None, AgentConfig())
-        assert cmd == ["codex", "exec", "--oss", "--json"]
+        assert cmd == [
+            "codex", "exec", "--oss",
+            "-s", "danger-full-access",
+            "-c", 'approval_policy="never"',
+            "--json",
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -1082,3 +1132,62 @@ class TestBackendName:
 
     def test_ollama_backend_name(self) -> None:
         assert OllamaCodexAgent()._backend_name == "codex-oss"
+
+
+# ---------------------------------------------------------------------------
+# list_agent_models
+# ---------------------------------------------------------------------------
+
+from llm_provider.agent import CLAUDE_CODE_MODELS, CODEX_MODELS, list_agent_models
+
+
+class TestListAgentModels:
+    def test_claude_code_returns_list(self) -> None:
+        models = list_agent_models("claude-code")
+        assert isinstance(models, list)
+        assert "claude-sonnet-4-6" in models
+        assert "claude-opus-4-7" in models
+
+    def test_claude_code_returns_copy(self) -> None:
+        models = list_agent_models("claude-code")
+        models.clear()
+        assert len(CLAUDE_CODE_MODELS) > 0
+
+    def test_codex_returns_list(self) -> None:
+        models = list_agent_models("codex")
+        assert isinstance(models, list)
+        assert "gpt-5.4" in models
+        assert "gpt-5.3-codex" in models
+
+    def test_codex_returns_copy(self) -> None:
+        models = list_agent_models("codex")
+        models.clear()
+        assert len(CODEX_MODELS) > 0
+
+    def test_ollama_returns_names_on_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        fake_response = MagicMock()
+        fake_response.json.return_value = {
+            "models": [{"name": "qwen2.5:3b"}, {"name": "llama3:8b"}]
+        }
+        monkeypatch.setattr(httpx, "get", lambda *a, **kw: fake_response)
+        assert list_agent_models("ollama") == ["qwen2.5:3b", "llama3:8b"]
+
+    def test_codex_oss_alias(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        fake_response = MagicMock()
+        fake_response.json.return_value = {"models": [{"name": "phi4"}]}
+        monkeypatch.setattr(httpx, "get", lambda *a, **kw: fake_response)
+        assert list_agent_models("codex-oss") == ["phi4"]
+
+    def test_ollama_returns_empty_on_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        monkeypatch.setattr(httpx, "get", lambda *a, **kw: (_ for _ in ()).throw(httpx.ConnectError("x")))
+        assert list_agent_models("ollama") == []
+
+    def test_unknown_backend_raises(self) -> None:
+        with pytest.raises(ValueError, match="Unknown backend"):
+            list_agent_models("nope")
