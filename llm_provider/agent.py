@@ -56,6 +56,11 @@ class AgentConfig:
 
     working_directory: str = ""
     model: str = ""
+    effort: str = ""
+    """Reasoning/thinking effort level. Common slice across backends:
+    ``low | medium | high | xhigh``. Empty = backend default. Claude Code
+    accepts an additional ``max`` level; Codex accepts ``none``. Use those
+    only when targeting one backend explicitly."""
     max_turns: int = 0
     timeout: float = 0.0
     sandbox: str = ""
@@ -343,6 +348,8 @@ class ClaudeCodeAgent(AgentBackend):
         model = self._model or config.model
         if model:
             cmd += ["--model", model]
+        if config.effort:
+            cmd += ["--effort", config.effort]
         if config.max_turns > 0:
             cmd += ["--max-turns", str(config.max_turns)]
         if config.sandbox:
@@ -517,6 +524,8 @@ class _BaseCodexAgent(AgentBackend):
         model = self._model or config.model
         if model:
             cmd += ["-m", model]
+        if config.effort:
+            cmd += ["-c", f'model_reasoning_effort="{config.effort}"']
         if config.sandbox:
             cmd += ["-s", config.sandbox]
         if config.permission_mode:
