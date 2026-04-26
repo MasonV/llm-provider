@@ -547,13 +547,26 @@ class TestCodexBuildCmd:
     def test_minimal(self) -> None:
         agent = CodexAgent()
         cmd = agent.build_cmd("do stuff", AgentConfig())
-        assert cmd == ["codex", "exec", "do stuff", "--json"]
+        # `codex exec` always emits sandbox + approval overrides — see
+        # _BaseCodexAgent.build_cmd for the rationale (MCP elicitation
+        # auto-cancels otherwise).
+        assert cmd == [
+            "codex", "exec",
+            "-s", "danger-full-access",
+            "-c", 'approval_policy="never"',
+            "do stuff", "--json",
+        ]
 
     def test_stdin_mode_prompt_none(self) -> None:
         # prompt=None omits positional arg; codex reads from stdin
         agent = CodexAgent()
         cmd = agent.build_cmd(None, AgentConfig())
-        assert cmd == ["codex", "exec", "--json"]
+        assert cmd == [
+            "codex", "exec",
+            "-s", "danger-full-access",
+            "-c", 'approval_policy="never"',
+            "--json",
+        ]
 
     def test_no_oss_flag(self) -> None:
         agent = CodexAgent()
@@ -597,13 +610,13 @@ class TestCodexBuildCmd:
         cmd = agent.build_cmd("task", AgentConfig())
         assert not any("model_reasoning_effort" in t for t in cmd)
 
-    def test_permission_mode_maps_to_approval(self) -> None:
+    def test_permission_mode_not_emitted(self) -> None:
+        # `codex exec` has no -a flag — was a copy-paste from the Claude
+        # wrapper. permission_mode is intentionally ignored for codex.
         agent = CodexAgent()
         cfg = AgentConfig(permission_mode="never")
         cmd = agent.build_cmd("task", cfg)
-        assert "-a" in cmd
-        idx = cmd.index("-a")
-        assert cmd[idx + 1] == "never"
+        assert "-a" not in cmd
 
     def test_worktree_uses_worktree_path(self) -> None:
         agent = CodexAgent()
@@ -696,7 +709,12 @@ class TestOllamaCodexBuildCmd:
         agent = OllamaCodexAgent()
         cmd = agent.build_cmd("do stuff", AgentConfig())
         assert "--oss" in cmd
-        assert cmd == ["codex", "exec", "--oss", "do stuff", "--json"]
+        assert cmd == [
+            "codex", "exec", "--oss",
+            "-s", "danger-full-access",
+            "-c", 'approval_policy="never"',
+            "do stuff", "--json",
+        ]
 
     def test_model(self) -> None:
         agent = OllamaCodexAgent(model="qwen2.5:3b")
@@ -716,7 +734,12 @@ class TestOllamaCodexBuildCmd:
     def test_stdin_mode_prompt_none(self) -> None:
         agent = OllamaCodexAgent()
         cmd = agent.build_cmd(None, AgentConfig())
-        assert cmd == ["codex", "exec", "--oss", "--json"]
+        assert cmd == [
+            "codex", "exec", "--oss",
+            "-s", "danger-full-access",
+            "-c", 'approval_policy="never"',
+            "--json",
+        ]
 
 
 # ---------------------------------------------------------------------------
